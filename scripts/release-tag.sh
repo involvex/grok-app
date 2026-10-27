@@ -98,24 +98,31 @@ if n != 1:
 p.write_text(text2)
 print("Cargo.toml ->", ver)
 
-# Cargo.lock package stanza for this crate
-p = Path("src-tauri/Cargo.lock")
-if p.is_file():
-    lock = p.read_text()
-    lock2, n = re.subn(
-        r'(name = "grok-app"\nversion = ")[^"]+(")',
-        rf"\g<1>{ver}\2",
-        lock,
-        count=1,
-    )
-    if n != 1:
-        raise SystemExit("failed to patch Cargo.lock grok-app version")
-    p.write_text(lock2)
-    print("Cargo.lock grok-app ->", ver)
+# i18n version footer (domain modules after residual-i18n split)
+for rel in (
+    "src/i18n/messages/en/core.ts",
+    "src/i18n/messages/zh/core.ts",
+    "src/i18n/messages/zh-TW/core.ts",
+    # legacy barrels (if reintroduced)
+    "src/i18n/messages.ts",
+    "src/i18n/zh-tw.ts",
+):
+    p = Path(rel)
+    if not p.is_file():
+        continue
+    t = p.read_text()
+    t2, n = re.subn(r"(Grok v)[0-9]+\.[0-9]+\.[0-9]+", rf"\g<1>{ver}", t)
+    if n:
+        p.write_text(t2)
+        print(f"{rel} versionFooter ->", ver)
+    else:
+        print(f"warn: versionFooter pattern not found in {rel}")
 PY
 
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock \
-  README.md README_EN.md README_ZH.md README_RU.md 2>/dev/null || true
+git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml \
+  src/i18n/messages/en/core.ts src/i18n/messages/zh/core.ts src/i18n/messages/zh-TW/core.ts \
+  src/i18n/messages.ts src/i18n/zh-tw.ts \
+  README.md README_EN.md README_ZH.md 2>/dev/null || true
 if [[ -n "$(git status --porcelain)" ]]; then
   git commit -m "chore: release $TAG"
 fi

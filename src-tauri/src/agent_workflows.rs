@@ -17,6 +17,7 @@
 //!
 //! No visual workflow editor. Shared mode never rewrites `~/.grok/config.toml`.
 
+#![allow(dead_code)] // residual-clippy: normalize_enabled
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,7 +34,6 @@ use crate::store;
 pub const CONFIG_KEY: &str = "workflows_enabled";
 
 /// Normalize enable toggle (App default off).
-#[allow(dead_code)]
 pub fn normalize_enabled(raw: bool) -> bool {
     raw
 }
@@ -553,14 +553,12 @@ fn prepare_log(stdout: &str, stderr: &str) -> (Option<String>, bool) {
     }
 }
 
-#[allow(dead_code)]
 enum ThreadWait<T> {
     Done(T),
     TimedOut,
     JoinErr,
 }
 
-#[allow(dead_code)]
 fn wait_thread<T: Send + 'static>(
     handle: std::thread::JoinHandle<T>,
     timeout: Duration,
@@ -591,7 +589,6 @@ pub const WORKFLOW_RUN_PROGRESS_EVENT: &str = "workflows://run-progress";
 ///
 /// When `app` is provided, emits line-level progress on
 /// [`WORKFLOW_RUN_PROGRESS_EVENT`] so Settings can show a live log.
-#[allow(dead_code)]
 pub fn run_workflow(
     name: &str,
     project_path: Option<&str>,
@@ -761,7 +758,7 @@ fn run_workflow_inner(
 
     if let Some(out) = child.stdout.take() {
         let buf = Arc::clone(&stdout_buf);
-        let app_c = app.cloned();
+        let app_c = app.map(|a| a.clone());
         let n = name_owned.clone();
         let m = mode_owned.clone();
         let st = Arc::clone(&started_arc);
@@ -787,7 +784,7 @@ fn run_workflow_inner(
     }
     if let Some(err) = child.stderr.take() {
         let buf = Arc::clone(&stderr_buf);
-        let app_c = app.cloned();
+        let app_c = app.map(|a| a.clone());
         let n = name_owned.clone();
         let m = mode_owned.clone();
         let st = Arc::clone(&started_arc);

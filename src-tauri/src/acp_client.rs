@@ -1,6 +1,7 @@
 //! Real ACP client: spawn `grok agent stdio`, JSON-RPC line framing.
 //! Default production transport. Mock only when GROK_APP_ACP=mock.
 
+#![allow(dead_code)] // residual-clippy: spawn-flag helpers and unused field reads kept for protocol parity
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -13,7 +14,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{AgentError, AgentErrorCode};
@@ -60,7 +61,6 @@ pub enum AcpEvent {
         rpc_id: u64,
         tool_call_id: Option<String>,
         questions: Vec<AskUserQuestionItem>,
-        #[allow(dead_code)]
         raw: Value,
     },
     PermissionRequest {
@@ -116,16 +116,8 @@ pub enum AcpEvent {
         cached_read_tokens: Option<u64>,
         cache_creation_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
-        /// USD cost in integer ticks (see frontend `usdFromCostTicks`).
+        /// USD cost in 1e-6 ticks (1 tick = 1 micro-dollar) — avoids float drift.
         cost_usd_ticks: Option<u64>,
-        /// Model API rounds in this billing payload (`turn_completed.usage`).
-        model_calls: Option<u64>,
-        /// Summed reported per-call API time (ms). May under-count.
-        api_duration_ms: Option<u64>,
-        /// CLI `costIsPartial` — dollar figure may under-count.
-        cost_is_partial: Option<bool>,
-        /// CLI `usageIsIncomplete` — token/call totals may under-count.
-        usage_is_incomplete: Option<bool>,
         /// Agent's model context window (CLI denominator for %).
         context_window: Option<u64>,
         /// Agent-reported integer percentage (CLI style), when present.
@@ -172,58 +164,6 @@ pub enum AcpEvent {
     ProcessExited {
         code: Option<i32>,
     },
-    /// Subagent lifecycle from `_x.ai/session_notification`.
-    ///
-    /// CLI 1.0.x emits `subagent_spawned` / `subagent_progress` /
-    /// `subagent_finished` on the xAI extension notification channel; before
-    /// this the client dropped them and the Tasks panel could only *guess*
-    /// parent-child links from spawn-tool stream order.
-    Subagent(SubagentUpdate),
-}
-
-/// Lifecycle phase of a CLI subagent run (`spawn_subagent` / Task tool).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SubagentPhase {
-    Spawned,
-    Progress,
-    Finished,
-}
-
-impl SubagentPhase {
-    /// Wire-stable token used in the `session://subagent` payload.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SubagentPhase::Spawned => "spawned",
-            SubagentPhase::Progress => "progress",
-            SubagentPhase::Finished => "finished",
-        }
-    }
-}
-
-/// One subagent run as reported by the CLI. Every field beyond `subagent_id`
-/// is optional: the CLI omits what it does not know, and the UI must show an
-/// honest empty state rather than a fabricated value.
-///
-/// Only what the Tasks panel renders is carried. The CLI also sends
-/// `parent_session_id`, `model`, `tools_used`, `error_count`, `will_wake` and
-/// friends; the golden fixture keeps pinning that wire shape, but decoding a
-/// field nothing reads just widens the payload and the type for no one.
-#[derive(Debug, Clone)]
-pub struct SubagentUpdate {
-    pub phase: SubagentPhase,
-    pub subagent_id: String,
-    pub subagent_type: Option<String>,
-    pub description: Option<String>,
-    /// Terminal status on `subagent_finished` (`completed` / `failed` / …).
-    pub status: Option<String>,
-    pub duration_ms: Option<u64>,
-    pub turn_count: Option<u64>,
-    pub tool_call_count: Option<u64>,
-    pub tokens_used: Option<u64>,
-    /// Denominator for the row's occupancy percentage.
-    pub context_window_tokens: Option<u64>,
-    /// Final subagent answer (only on `subagent_finished`).
-    pub output: Option<String>,
 }
 
 /// Host circuit-breaker: after this many provider retries, cancel the turn.
@@ -254,27 +194,16 @@ struct Pending {
 }
 
 const HANDSHAKE_TIMEOUT_SECS: u64 = 45;
-/// session/load replays the full history (and may auto-compact a ~200k-token
-/// context several times) before replying. Field log: 37s ok / >45s timeout on
-/// the same session. Give it its own, larger budget.
-const SESSION_LOAD_TIMEOUT_SECS: u64 = 150;
-
-/// Whether to ask the agent to skip transcript replay on `session/load`.
-fn session_load_no_replay() -> bool {
-    !matches!(
-        std::env::var("GROK_APP_FULL_REPLAY").ok().as_deref(),
-        Some("1") | Some("true")
-    )
-}
 const AUTH_TIMEOUT_SECS: u64 = 12;
 /// Max wait for a single stdin write (JSON-RPC line). A wedged agent with a full
 /// pipe used to block forever here — which froze interject ("引导"), cancel, and
 /// any other Host→agent RPC before the request-level timeout could start.
 const STDIN_WRITE_TIMEOUT_SECS: u64 = 8;
 /// Max **silence** (no `session/update`) while waiting for `session/prompt`.
-/// Every inbound update re-arms this window — do **not** cap on total turn age.
-/// 30 minutes: a single image_gen can stay quiet longer than the old 10 min.
-const PROMPT_IDLE_TIMEOUT_SECS: u64 = 1800;
+/// Long tool chains that keep emitting updates re-arm this window.
+const PROMPT_IDLE_TIMEOUT_SECS: u64 = 600;
+/// Absolute ceiling for one `session/prompt` wait (wedged process / lost RPC).
+const PROMPT_ABSOLUTE_TIMEOUT_SECS: u64 = 4 * 60 * 60;
 /// Poll slice while waiting for the `session/prompt` oneshot.
 const PROMPT_WAIT_SLICE_SECS: u64 = 5;
 /// Legacy alias used in docs/comments — idle silence window for prompt RPC.
@@ -291,102 +220,41 @@ const PROMPT_TIMEOUT_SECS: u64 = PROMPT_IDLE_TIMEOUT_SECS;
 /// it is still streaming the answer, and resolving the RPC on a fixed timer
 /// ended the turn mid-answer — the host then dropped every later chunk as
 /// replay, so the journal kept only a prefix and the chat looked stuck.
-/// Prompt wait uses the same idle idea (`PROMPT_IDLE_TIMEOUT_SECS`) only —
-/// total turn age is not a timeout.
+/// Prompt wait uses the same idle idea (`PROMPT_IDLE_TIMEOUT_SECS`) plus an
+/// absolute ceiling (`PROMPT_ABSOLUTE_TIMEOUT_SECS`).
 const PROMPT_COMPLETE_FALLBACK_GRACE_MS: u64 = 3000;
 
-/// Whether a `session/prompt` wait should fail for silence.
+/// Whether a `session/prompt` wait should fail for silence or absolute age.
 ///
 /// - `last_update`: last inbound `session/update` (None → use wait start as baseline)
 /// - `wait_started`: when the RPC was dispatched
 /// - `now`: current time
-///
-/// Progress resets the clock. A turn that keeps emitting updates may run
-/// indefinitely; the user can Stop. Lost RPC / wedged silence still dies
-/// after `idle_timeout`.
 fn prompt_wait_should_timeout(
     last_update: Option<Instant>,
     wait_started: Instant,
     now: Instant,
     idle_timeout: Duration,
-) -> bool {
+    absolute_timeout: Duration,
+) -> Option<&'static str> {
+    if now.saturating_duration_since(wait_started) >= absolute_timeout {
+        return Some("absolute");
+    }
     let baseline = last_update.unwrap_or(wait_started);
-    now.saturating_duration_since(baseline) >= idle_timeout
+    if now.saturating_duration_since(baseline) >= idle_timeout {
+        return Some("idle");
+    }
+    None
 }
 
 /// Whether a pending prompt belongs to the fallback target session.
-///
-/// Only exact matches: both sides stamped with the same sid, or both unknown.
-/// Cross-matching `(Some, None)` used to let session A's early `prompt_complete`
-/// free session B's waiter on a shared process (P0-4). Unstamped / unique
-/// fallbacks go through [`pending_prompt_ids_for`].
+/// A prompt without a recorded sid matches any target (legacy single-session);
+/// an explicit target only frees its own session's waiter (concurrent).
 fn pending_prompt_matches(prompt_sid: Option<&str>, target: Option<&str>) -> bool {
     match (target, prompt_sid) {
         (Some(a), Some(b)) => a == b,
-        (None, None) => true,
-        _ => false,
+        (None, _) => true,
+        (Some(_), None) => true,
     }
-}
-
-/// Select `session/prompt` waiters for a `prompt_complete` fallback.
-///
-/// Prefer exact sid matches. Only when that set is empty and **exactly one**
-/// pending prompt exists, allow an unstamped/legacy pairing so single-session
-/// CLI traffic without `sessionId` still completes.
-fn pending_prompt_ids_for(pending: &HashMap<u64, Pending>, target: Option<&str>) -> Vec<u64> {
-    let prompts: Vec<(u64, Option<&str>)> = pending
-        .iter()
-        .filter(|(_, p)| p.method == "session/prompt")
-        .map(|(id, p)| (*id, p.session_id.as_deref()))
-        .collect();
-    let exact: Vec<u64> = prompts
-        .iter()
-        .filter(|(_, sid)| pending_prompt_matches(*sid, target))
-        .map(|(id, _)| *id)
-        .collect();
-    if !exact.is_empty() {
-        return exact;
-    }
-    if prompts.len() == 1 {
-        let (id, sid) = prompts[0];
-        if target.is_none() || sid.is_none() {
-            return vec![id];
-        }
-    }
-    Vec::new()
-}
-
-/// Whether any prompt captured by a fallback is still awaiting its RPC result.
-///
-/// A fallback must stay bound to the prompt ids that existed when the matching
-/// `prompt_complete` notification arrived. Looking up the session again later
-/// can adopt a newer turn that started during the grace window.
-fn has_pending_prompt_ids(pending: &HashMap<u64, Pending>, prompt_ids: &[u64]) -> bool {
-    prompt_ids.iter().any(|id| {
-        pending
-            .get(id)
-            .is_some_and(|p| p.method == "session/prompt")
-    })
-}
-
-/// Remove only the prompt waiters captured by one fallback generation.
-fn take_pending_prompt_ids(
-    pending: &mut HashMap<u64, Pending>,
-    prompt_ids: &[u64],
-) -> Vec<(u64, Pending)> {
-    prompt_ids
-        .iter()
-        .filter_map(|id| {
-            let is_prompt = pending
-                .get(id)
-                .is_some_and(|p| p.method == "session/prompt");
-            if is_prompt {
-                pending.remove(id).map(|p| (*id, p))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 /// Pure decision for the `prompt_complete` fallback: release the waiter only
@@ -402,13 +270,6 @@ pub struct AcpClient {
     /// The spawned CLI process, or `None` in API mode (connected to a remote
     /// ACP server over TCP instead of spawning `grok agent stdio`).
     child: AsyncMutex<Option<Child>>,
-    /// OS PID captured at spawn before the child is handed to reader tasks.
-    /// `None` in TCP / API mode (no local process).
-    child_pid: Option<u32>,
-    /// Local native spawn (not TCP / SSH / WSL). On Windows, enables
-    /// `CREATE_NEW_PROCESS_GROUP` at spawn and `taskkill /T` on stop so
-    /// tool/shell grandchildren die with the agent.
-    owns_local_process_tree: bool,
     /// Write half of the transport (child stdin, or the TCP write half). Both
     /// impl `AsyncWrite`, so the JSON-RPC line protocol is transport-agnostic.
     stdin: AsyncMutex<Option<Box<dyn AsyncWrite + Unpin + Send>>>,
@@ -416,27 +277,17 @@ pub struct AcpClient {
     pending: ParkingMutex<HashMap<u64, Pending>>,
     event_tx: mpsc::UnboundedSender<(Option<String>, AcpEvent)>,
     agent_session_id: ParkingMutex<Option<String>>,
-    #[allow(dead_code)]
     cli_path: PathBuf,
     cwd: PathBuf,
     stopped: AtomicBool,
     reader_alive: AtomicBool,
-    /// Cancels the stdout/TCP read loop on an intentional shutdown. Without
-    /// this, a remote ACP socket could keep its read half open and deliver late
-    /// events after `kill()` had already released the session slot.
-    reader_stop: Arc<Notify>,
     /// Recent stderr lines for crash diagnostics (ring, newest last).
     stderr_tail: ParkingMutex<Vec<String>>,
-    /// Last inbound `session/update` per agent session id (P0-4).
-    /// Stamped updates only extend that session's idle / prompt_complete grace.
-    last_update_by_session: ParkingMutex<HashMap<String, Instant>>,
-    /// Unstamped `session/update` (CLI omitted sessionId) — process-level only.
-    last_update_unstamped: ParkingMutex<Option<Instant>>,
+    /// Last inbound `session/update` — proof the agent is still producing turn
+    /// output. Re-arms the `prompt_complete` fallback window.
+    last_update_at: ParkingMutex<Option<Instant>>,
     /// Official side-channel: skip App MCP inject on session/new.
     empty_mcp_servers: bool,
-    /// App session (chat) this process serves: scopes the per-session MCP tools
-    /// (the PR monitor watches PRs for one chat).
-    app_session_id: Option<String>,
     /// Effective `--sandbox` profile at spawn (process-level gate for parked reuse).
     sandbox_profile: ParkingMutex<Option<String>>,
     /// Route class at spawn: custom relay (api_key, no OIDC) vs official OIDC.
@@ -445,28 +296,12 @@ pub struct AcpClient {
     /// provider section id; that mis-labeled processes as "official" and
     /// let them be reused after auth.json was cleared → #528 re-login).
     custom_route: bool,
-    /// `official` or the custom section id this process was spawned for.
-    route_provider_id: String,
-    /// Agent `initialize` advertisement for rewind RPCs.
-    /// `None` = unknown (try RPC); `Some(false)` = skip; `Some(true)` = call.
-    rewind_supported: ParkingMutex<Option<bool>>,
-    /// OpenSSH alias this process was spawned with. Remote cwd is not local.
-    ssh_alias: Option<String>,
-    /// True when this process was spawned via `wsl.exe` (`cli_backend=wsl`).
-    /// ACP session cwd must be a Linux path (`/mnt/<drive>/…`); host still
-    /// keeps the Windows `cwd` for local fs / MCP / sandbox reuse checks.
-    wsl_active: bool,
-    /// Private `GROK_HOME` sealed for this process (#1293). `None` for
-    /// `~/.grok`, official-aux, SSH, and TCP. Discarded in `kill`.
-    proc_home: std::sync::Mutex<Option<PathBuf>>,
 }
 
 /// Options applied at agent process start (CLI flags).
 #[derive(Debug, Clone, Default)]
 pub struct SpawnOptions {
     pub model_id: Option<String>,
-    /// `official` or a custom section id. `None` follows the global route.
-    pub route_provider_id: Option<String>,
     pub effort: Option<String>,
     /// App permission policy id (ask / accept_edits / …).
     pub permission_policy: Option<String>,
@@ -504,20 +339,696 @@ pub struct SpawnOptions {
     /// When true, `session/new` injects empty `mcpServers` (official side jobs
     /// must not re-inject the `official-aux` MCP that shells out to `grok -p`).
     pub empty_mcp_servers: bool,
-    /// OpenSSH Host alias. When set, spawn `ssh -T` and run grok on that host
-    /// (remote cwd). Do not treat `cwd` as a local `std::fs` path.
-    pub ssh_alias: Option<String>,
-    /// When true, pass top-level `grok --trust` so headless ACP loads project
-    /// instructions (AGENTS.md) and project skills for an App-trusted folder.
-    pub folder_trust: bool,
-    /// App session (chat) this agent process serves. The PR-monitor MCP tools
-    /// watch PRs *for a chat*, so the injected server needs to know which one.
-    pub app_session_id: Option<String>,
 }
 
-mod spawn_flags;
-use spawn_flags::apply_grok_build_proxy_env;
-pub use spawn_flags::*;
+/// Pure helper: top-level CLI args for `--fork-session`.
+///
+/// `["--fork-session"]` when enabled; empty otherwise. The TUI requires this
+/// with `--resume`/`--continue`. Host `agent stdio` uses ACP `session/fork`
+/// instead of bare CLI flags (CLI errors without resume).
+pub fn fork_session_spawn_flags(enabled: bool) -> Vec<&'static str> {
+    if enabled {
+        vec!["--fork-session"]
+    } else {
+        vec![]
+    }
+}
+
+/// Extract the forked agent session id from an ACP fork response.
+///
+/// Accepts standard `sessionId` or Grok extension `newSessionId`. Rejects empty
+/// and equal-to-source ids (fork must allocate a **new** id).
+pub fn parse_fork_session_id(
+    result: &serde_json::Value,
+    source_session_id: &str,
+) -> Option<String> {
+    let raw = result
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.get("newSessionId").and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    // Fork semantics require a distinct id; reuse would mutate the source.
+    if raw == source_session_id.trim() {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// Pure helper: top-level CLI args for session extra rules (before `agent`).
+///
+/// `["--rules", text]` — empty when none. Trims, drops empty, clamps length.
+pub fn extra_rules_spawn_flags(rules: Option<&str>) -> Vec<String> {
+    let normalized = crate::store::sanitize_extra_rules(rules.map(|s| s.to_string()));
+    match normalized {
+        Some(text) => vec!["--rules".into(), text],
+        None => Vec::new(),
+    }
+}
+
+/// Pure helper: top-level CLI args for system prompt override (before `agent`).
+///
+/// `["--system-prompt-override", text]` — empty when none.
+/// Trims, strips NUL, drops empty, clamps length. Prefer the long flag name
+/// (CLI also accepts `--system-prompt`).
+pub fn system_prompt_override_spawn_flags(prompt: Option<&str>) -> Vec<String> {
+    let normalized = crate::store::sanitize_system_prompt_override(prompt.map(|s| s.to_string()));
+    match normalized {
+        Some(text) => vec!["--system-prompt-override".into(), text],
+        None => Vec::new(),
+    }
+}
+
+/// Pure helper: agent-option CLI args for session plugin dirs (before `stdio`).
+///
+/// `["--plugin-dir", path, …]` — empty when no dirs. Trims, drops empty, dedupes.
+pub fn plugin_dir_spawn_flags(dirs: &[String]) -> Vec<String> {
+    let paths = crate::store::normalize_plugin_dirs(dirs.iter().cloned());
+    let mut out = Vec::with_capacity(paths.len() * 2);
+    for p in paths {
+        out.push("--plugin-dir".into());
+        out.push(p);
+    }
+    out
+}
+
+/// Map App policy → CLI `--permission-mode` value (policy only; no plan/YOLO override).
+///
+/// Official CLI enum: `default | acceptEdits | auto | dontAsk | bypassPermissions | plan`.
+pub fn cli_permission_mode(policy: &str) -> &'static str {
+    use crate::permission::PermissionPolicy;
+    match PermissionPolicy::parse(policy) {
+        PermissionPolicy::AcceptEdits => "acceptEdits",
+        PermissionPolicy::DontAsk => "dontAsk",
+        PermissionPolicy::Auto => "auto",
+        PermissionPolicy::AlwaysApprove => "bypassPermissions",
+        // Host session allow-list is applied in-process; CLI still asks.
+        PermissionPolicy::AllowForSession
+        | PermissionPolicy::AllowOnce
+        | PermissionPolicy::Deny
+        | PermissionPolicy::Ask => "default",
+    }
+}
+
+/// Resolve effective CLI `--permission-mode` from App policy + product session mode.
+///
+/// Precedence (Grok Build): YOLO / `always_approve` → `bypassPermissions`;
+/// product `plan` mode → `plan`; else policy table.
+pub fn resolve_cli_permission_mode(policy: &str, product_mode: Option<&str>) -> &'static str {
+    use crate::permission::PermissionPolicy;
+    if matches!(
+        PermissionPolicy::parse(policy),
+        PermissionPolicy::AlwaysApprove
+    ) {
+        return "bypassPermissions";
+    }
+    if product_mode
+        .map(|m| m.trim().eq_ignore_ascii_case("plan"))
+        .unwrap_or(false)
+    {
+        return "plan";
+    }
+    cli_permission_mode(policy)
+}
+
+/// Top-level spawn args: `["--permission-mode", "<mode>"]`.
+pub fn permission_mode_spawn_flags(policy: &str, product_mode: Option<&str>) -> [String; 2] {
+    let mode = resolve_cli_permission_mode(policy, product_mode);
+    ["--permission-mode".into(), mode.into()]
+}
+
+/// Whether agent should also get `--always-approve` (YOLO / bypassPermissions).
+pub fn should_pass_always_approve(policy: &str, product_mode: Option<&str>) -> bool {
+    resolve_cli_permission_mode(policy, product_mode) == "bypassPermissions"
+}
+
+/// Whether `id` is safe to pass as CLI `--reasoning-effort <id>`.
+///
+/// Accepts official Grok tiers (`low` / `medium` / `high`) and custom-channel
+/// ids such as `max` / `xhigh`. Rejects empty, overly long, or non-token shapes.
+/// Passed as a separate argv element (not shell-interpolated).
+pub fn is_spawnable_reasoning_effort(id: &str) -> bool {
+    let t = id.trim();
+    if t.is_empty() || t.len() > 64 {
+        return false;
+    }
+    let mut chars = t.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Pure spawn plan for the OS-level sandbox profile.
+///
+/// `--sandbox` is a **top-level** `grok` flag (not under `agent` / `stdio`),
+/// and the CLI also reads `GROK_SANDBOX`. When the profile is off/empty we
+/// apply neither so the agent stays unrestricted (CLI default).
+///
+/// Soft-fail: known-old CLIs (&lt; 0.2.112) omit the flag/env so clap does not
+/// reject unknown `--sandbox` (AGENT_CRASHED). Unknown versions still emit
+/// (forward-compatible with current Grok Build).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxSpawnSpec {
+    pub profile: String,
+}
+
+/// First App-aligned floor where `--sandbox` / `GROK_SANDBOX` is expected.
+pub const SANDBOX_MIN_CLI: (u64, u64, u64) = (0, 2, 112);
+
+impl SandboxSpawnSpec {
+    /// Build from a settings value. `None` means do not pass sandbox flags/env.
+    pub fn from_setting(profile: &str) -> Option<Self> {
+        let p = profile.trim();
+        if p.is_empty() || p.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        Some(Self {
+            profile: p.to_ascii_lowercase(),
+        })
+    }
+
+    /// Top-level CLI args: `["--sandbox", "<profile>"]` (before `agent`).
+    pub fn cli_args(&self) -> [String; 2] {
+        ["--sandbox".into(), self.profile.clone()]
+    }
+
+    /// Env var name + value for `GROK_SANDBOX`.
+    pub fn env_pair(&self) -> (String, String) {
+        ("GROK_SANDBOX".into(), self.profile.clone())
+    }
+}
+
+/// `Some(true)` when CLI ≥ sandbox min; `Some(false)` when older; `None` unparseable.
+pub fn cli_supports_sandbox(raw_version: &str) -> Option<bool> {
+    let token = crate::cli_probe::extract_version_token(raw_version)?;
+    let parsed = crate::app_update::parse_semver(&token)?;
+    Some(parsed >= SANDBOX_MIN_CLI)
+}
+
+/// Soft-fail: whether to apply sandbox flags/env for this CLI version.
+///
+/// - Known ≥ 0.2.112 → apply
+/// - Known older → omit
+/// - Unknown / missing → apply (forward-compatible; modern CLI accepts the flag)
+pub fn should_apply_sandbox(raw_cli_version: Option<&str>) -> bool {
+    match raw_cli_version {
+        Some(v) => cli_supports_sandbox(v) != Some(false),
+        None => true,
+    }
+}
+
+/// Pure helper used by spawn + unit tests: args + env when sandbox is on.
+pub fn sandbox_spawn_flags(profile: &str) -> Option<(Vec<String>, (String, String))> {
+    let spec = SandboxSpawnSpec::from_setting(profile)?;
+    Some((spec.cli_args().to_vec(), spec.env_pair()))
+}
+
+/// Soft-fail variant: omit when CLI is known older than {@link SANDBOX_MIN_CLI}.
+pub fn sandbox_spawn_flags_soft(
+    profile: &str,
+    raw_cli_version: Option<&str>,
+) -> Option<(Vec<String>, (String, String))> {
+    if !should_apply_sandbox(raw_cli_version) {
+        return None;
+    }
+    sandbox_spawn_flags(profile)
+}
+
+// ── Compaction mode / detail (CLI 0.2.117+) ────────────────────────────────
+//
+// Top-level: `--compaction-mode summary|transcript|segments` → GROK_COMPACTION_MODE
+//            `--compaction-detail none|minimal|balanced|verbose` → GROK_COMPACTION_DETAIL
+// Detail only affects `segments` (CLI default verbose). Host always sets env
+// (ignored by older CLIs); CLI flags pass only when version ≥ 0.2.117.
+
+/// First CLI version that accepts the compaction flags.
+pub const COMPACTION_CLI_FLAGS_MIN: (u64, u64, u64) = (0, 2, 117);
+
+pub const DEFAULT_COMPACTION_MODE: &str = "summary";
+pub const DEFAULT_COMPACTION_DETAIL: &str = "verbose";
+
+/// Normalize settings / UI value → known mode id.
+pub fn normalize_compaction_mode(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "transcript" => "transcript",
+        "segments" => "segments",
+        "summary" | "" => DEFAULT_COMPACTION_MODE,
+        _ => DEFAULT_COMPACTION_MODE,
+    }
+}
+
+/// Normalize settings / UI value → known detail id.
+pub fn normalize_compaction_detail(raw: &str) -> &'static str {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => "none",
+        "minimal" => "minimal",
+        "balanced" => "balanced",
+        "verbose" | "" => DEFAULT_COMPACTION_DETAIL,
+        _ => DEFAULT_COMPACTION_DETAIL,
+    }
+}
+
+/// Detail only applies when mode is `segments`.
+pub fn compaction_detail_applies(mode: &str) -> bool {
+    normalize_compaction_mode(mode) == "segments"
+}
+
+/// Top-level CLI argv for mode + optional detail (before `agent`).
+pub fn compaction_spawn_args(mode: &str, detail: &str) -> Vec<String> {
+    let m = normalize_compaction_mode(mode);
+    let mut args = vec!["--compaction-mode".into(), m.into()];
+    if compaction_detail_applies(m) {
+        let d = normalize_compaction_detail(detail);
+        args.push("--compaction-detail".into());
+        args.push(d.into());
+    }
+    args
+}
+
+/// Env pairs for the agent process (always safe on older CLIs).
+pub fn compaction_spawn_env(mode: &str, detail: &str) -> Vec<(String, String)> {
+    let m = normalize_compaction_mode(mode);
+    let mut out = vec![("GROK_COMPACTION_MODE".into(), m.into())];
+    if compaction_detail_applies(m) {
+        out.push((
+            "GROK_COMPACTION_DETAIL".into(),
+            normalize_compaction_detail(detail).into(),
+        ));
+    }
+    out
+}
+
+/// Whether CLI flags should be passed (not only env).
+/// Unknown / unparseable version → false (env-only soft-fail).
+pub fn cli_supports_compaction_flags(raw_version: Option<&str>) -> bool {
+    let Some(raw) = raw_version.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(token) = crate::cli_probe::extract_version_token(raw) else {
+        return false;
+    };
+    let Some(parsed) = crate::app_update::parse_semver(&token) else {
+        return false;
+    };
+    parsed >= COMPACTION_CLI_FLAGS_MIN
+}
+
+/// Apply env always; CLI flags only when `pass_cli_flags` is true.
+pub fn apply_compaction_to_command(
+    cmd: &mut Command,
+    mode: &str,
+    detail: &str,
+    pass_cli_flags: bool,
+) {
+    for (k, v) in compaction_spawn_env(mode, detail) {
+        cmd.env(k, v);
+    }
+    if pass_cli_flags {
+        for a in compaction_spawn_args(mode, detail) {
+            cmd.arg(a);
+        }
+    }
+}
+
+pub const MAX_AGENT_TURNS_CAP: u32 = 200;
+pub const MIN_AGENT_TURNS: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaxTurnsSpawnSpec {
+    pub turns: u32,
+}
+
+impl MaxTurnsSpawnSpec {
+    pub fn from_setting(raw: Option<u32>) -> Option<Self> {
+        let n = raw?;
+        if n == 0 {
+            return None;
+        }
+        Some(Self {
+            turns: n.clamp(MIN_AGENT_TURNS, MAX_AGENT_TURNS_CAP),
+        })
+    }
+
+    pub fn cli_args(&self) -> [String; 2] {
+        ["--max-turns".into(), self.turns.to_string()]
+    }
+}
+
+pub fn normalize_max_agent_turns(raw: Option<u32>) -> Option<u32> {
+    MaxTurnsSpawnSpec::from_setting(raw).map(|s| s.turns)
+}
+
+/// Session override wins when set (1–200); else global settings. 0 / None = inherit.
+pub fn resolve_max_agent_turns(session: Option<u32>, global: Option<u32>) -> Option<u32> {
+    normalize_max_agent_turns(session).or_else(|| normalize_max_agent_turns(global))
+}
+
+pub fn max_turns_cli_args(raw: Option<u32>) -> Option<Vec<String>> {
+    let spec = MaxTurnsSpawnSpec::from_setting(raw)?;
+    Some(spec.cli_args().to_vec())
+}
+
+// ── Background wait policy (CLI 0.2.117+, headless-first) ──────────────────
+
+/// First CLI that accepts `--no-wait-for-background` / `--background-wait-timeout`.
+pub const BACKGROUND_WAIT_MIN_CLI: (u64, u64, u64) = (0, 2, 117);
+
+pub const MIN_BACKGROUND_WAIT_TIMEOUT_SEC: u32 = 1;
+pub const MAX_BACKGROUND_WAIT_TIMEOUT_SEC: u32 = 3600;
+pub const DEFAULT_BACKGROUND_WAIT_TIMEOUT_SEC: u32 = 600;
+
+/// `wait` (default) | `no_wait` | `timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundWaitPolicy {
+    Wait,
+    NoWait,
+    Timeout,
+}
+
+impl BackgroundWaitPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::NoWait => "no_wait",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+/// Normalize a settings policy string. Unknown / empty → `wait`.
+pub fn normalize_background_wait_policy(raw: &str) -> BackgroundWaitPolicy {
+    let s = raw.trim().to_ascii_lowercase().replace('-', "_");
+    match s.as_str() {
+        "" | "wait" | "default" => BackgroundWaitPolicy::Wait,
+        "no_wait" | "nowait" | "no_wait_for_background" | "false" => BackgroundWaitPolicy::NoWait,
+        "timeout" | "timed" | "secs" | "seconds" => BackgroundWaitPolicy::Timeout,
+        _ => BackgroundWaitPolicy::Wait,
+    }
+}
+
+/// Clamp timeout seconds for `--background-wait-timeout` (1–3600).
+pub fn normalize_background_wait_timeout_sec(raw: u32) -> u32 {
+    raw.clamp(
+        MIN_BACKGROUND_WAIT_TIMEOUT_SEC,
+        MAX_BACKGROUND_WAIT_TIMEOUT_SEC,
+    )
+}
+
+/// Top-level CLI argv for the policy. Empty for `wait` (CLI default).
+pub fn background_wait_spawn_flags(policy: &str, timeout_sec: u32) -> Vec<String> {
+    match normalize_background_wait_policy(policy) {
+        BackgroundWaitPolicy::Wait => Vec::new(),
+        BackgroundWaitPolicy::NoWait => vec!["--no-wait-for-background".into()],
+        BackgroundWaitPolicy::Timeout => {
+            let secs = normalize_background_wait_timeout_sec(timeout_sec);
+            vec!["--background-wait-timeout".into(), secs.to_string()]
+        }
+    }
+}
+
+/// Whether two policy+timeout pairs are equivalent after normalize.
+pub fn background_wait_settings_equal(
+    a_policy: &str,
+    a_timeout: u32,
+    b_policy: &str,
+    b_timeout: u32,
+) -> bool {
+    let pa = normalize_background_wait_policy(a_policy);
+    let pb = normalize_background_wait_policy(b_policy);
+    if pa != pb {
+        return false;
+    }
+    if pa != BackgroundWaitPolicy::Timeout {
+        return true;
+    }
+    normalize_background_wait_timeout_sec(a_timeout)
+        == normalize_background_wait_timeout_sec(b_timeout)
+}
+
+/// `Some(true)` when CLI ≥ 0.2.117; `Some(false)` when older; `None` unparseable.
+pub fn cli_supports_background_wait(raw_version: &str) -> Option<bool> {
+    let token = crate::cli_probe::extract_version_token(raw_version)?;
+    let parsed = crate::app_update::parse_semver(&token)?;
+    Some(parsed >= BACKGROUND_WAIT_MIN_CLI)
+}
+
+/// Soft-fail gate: emit flags only when the CLI is known to support them.
+///
+/// - Known ≥ 0.2.117 → policy flags
+/// - Known older / unknown + non-default → omit (avoid clap crash)
+/// - Default `wait` → empty always
+pub fn background_wait_spawn_flags_soft(
+    policy: &str,
+    timeout_sec: u32,
+    raw_cli_version: Option<&str>,
+) -> Vec<String> {
+    let args = background_wait_spawn_flags(policy, timeout_sec);
+    if args.is_empty() {
+        return args;
+    }
+    match raw_cli_version {
+        Some(v) if cli_supports_background_wait(v) == Some(true) => args,
+        _ => Vec::new(),
+    }
+}
+
+// ── Include partial stream events (CLI 0.2.117+, headless) ─────────────────
+
+/// First CLI that accepts `--include-partial-messages`.
+pub const INCLUDE_PARTIAL_MESSAGES_MIN_CLI: (u64, u64, u64) = (0, 2, 117);
+
+/// Anthropic Messages API NDJSON wire format (pairs with partial stream events).
+pub const HEADLESS_FORMAT_STREAMING_MESSAGES_JSON: &str = "streaming-messages-json";
+
+/// ACP-native streaming NDJSON (Remote IM default; no partial stream events).
+pub const HEADLESS_FORMAT_STREAMING_JSON: &str = "streaming-json";
+
+/// True when format is `streaming-messages-json` (aliases normalized).
+pub fn is_streaming_messages_json_format(format: &str) -> bool {
+    let s = format.trim().to_ascii_lowercase().replace('_', "-");
+    matches!(
+        s.as_str(),
+        "streaming-messages-json" | "streaming-message-json" | "messages-json"
+    )
+}
+
+/// Top-level CLI flags for `--include-partial-messages`.
+/// Empty unless `enabled` **and** format is `streaming-messages-json`.
+pub fn include_partial_messages_spawn_flags(
+    enabled: bool,
+    output_format: &str,
+) -> Vec<&'static str> {
+    if enabled && is_streaming_messages_json_format(output_format) {
+        vec!["--include-partial-messages"]
+    } else {
+        vec![]
+    }
+}
+
+/// `Some(true)` when CLI ≥ 0.2.117; `Some(false)` when older; `None` unparseable.
+pub fn cli_supports_include_partial_messages(raw_version: &str) -> Option<bool> {
+    let token = crate::cli_probe::extract_version_token(raw_version)?;
+    let parsed = crate::app_update::parse_semver(&token)?;
+    Some(parsed >= INCLUDE_PARTIAL_MESSAGES_MIN_CLI)
+}
+
+/// Soft-fail gate: emit flag only when CLI is known to support it.
+///
+/// - Known ≥ 0.2.117 + enabled + streaming-messages-json → flag
+/// - Known older / unknown → omit (avoid clap crash)
+/// - Disabled or wrong format → empty always
+pub fn include_partial_messages_spawn_flags_soft(
+    enabled: bool,
+    output_format: &str,
+    raw_cli_version: Option<&str>,
+) -> Vec<&'static str> {
+    let args = include_partial_messages_spawn_flags(enabled, output_format);
+    if args.is_empty() {
+        return args;
+    }
+    match raw_cli_version {
+        Some(v) if cli_supports_include_partial_messages(v) == Some(true) => args,
+        _ => vec![],
+    }
+}
+
+/// Load AppSettings + soft-gate for spawn sites (headless / ACP).
+pub fn background_wait_spawn_flags_from_settings(
+    settings: &crate::store::AppSettings,
+    raw_cli_version: Option<&str>,
+) -> Vec<String> {
+    background_wait_spawn_flags_soft(
+        &settings.background_wait_policy,
+        settings.background_wait_timeout_sec,
+        raw_cli_version,
+    )
+}
+
+/// Resolve headless format + partial flag for Remote IM / diagnostics when the
+/// user enables partial stream events.
+///
+/// - Partial on + CLI ≥ 0.2.117 → `streaming-messages-json` + flag
+/// - Otherwise → `streaming-json` (no flag; soft-fail older CLI)
+pub fn resolve_headless_stream_for_partial(
+    include_partial: bool,
+    raw_cli_version: Option<&str>,
+) -> (&'static str, Vec<&'static str>) {
+    let can = raw_cli_version.and_then(cli_supports_include_partial_messages) == Some(true);
+    if include_partial && can {
+        (
+            HEADLESS_FORMAT_STREAMING_MESSAGES_JSON,
+            vec!["--include-partial-messages"],
+        )
+    } else {
+        (HEADLESS_FORMAT_STREAMING_JSON, vec![])
+    }
+}
+
+/// Load settings + CLI version soft-gate for Remote IM headless.
+pub fn resolve_headless_stream_from_settings(
+    settings: &crate::store::AppSettings,
+    raw_cli_version: Option<&str>,
+) -> (&'static str, Vec<&'static str>) {
+    resolve_headless_stream_for_partial(settings.include_partial_messages, raw_cli_version)
+}
+
+pub fn disable_web_search_spawn_flags(disable: bool) -> Vec<&'static str> {
+    if disable {
+        vec!["--disable-web-search"]
+    } else {
+        vec![]
+    }
+}
+
+/// Session override wins when `Some`; else global Settings.
+/// When effective true, spawn passes top-level `--no-ask-user` (CLI ≥ 0.2.117).
+pub fn resolve_no_ask_user(session: Option<bool>, global: bool) -> bool {
+    session.unwrap_or(global)
+}
+
+/// Top-level CLI flags for `--no-ask-user`. Empty when off (CLI default).
+pub fn no_ask_user_spawn_flags(enabled: bool) -> Vec<&'static str> {
+    if enabled {
+        vec!["--no-ask-user"]
+    } else {
+        vec![]
+    }
+}
+
+/// Normalize tool ids for `--disallowed-tools`: trim, drop empty, dedupe
+/// case-insensitively (first spelling wins).
+pub fn normalize_disallowed_tools(tools: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in tools {
+        for piece in raw.split(',') {
+            let t = piece.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let key = t.to_ascii_lowercase();
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Spawn argv for denylist: `["--disallowed-tools", "a,b"]` or empty.
+pub fn disallowed_tools_spawn_flags(tools: &[String]) -> Vec<String> {
+    let cleaned = normalize_disallowed_tools(tools);
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+    vec!["--disallowed-tools".into(), cleaned.join(",")]
+}
+
+/// Order-independent, case-insensitive equality for soft-respawn flip checks.
+pub fn disallowed_tools_equal(a: &[String], b: &[String]) -> bool {
+    let mut aa: Vec<String> = normalize_disallowed_tools(a)
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    let mut bb: Vec<String> = normalize_disallowed_tools(b)
+        .into_iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    aa.sort();
+    bb.sort();
+    aa == bb
+}
+
+/// Normalize tool ids for `--tools` allowlist: same rules as denylist.
+pub fn normalize_allowed_tools(tools: &[String]) -> Vec<String> {
+    normalize_disallowed_tools(tools)
+}
+
+/// Spawn argv for allowlist: `["--tools", "a,b"]` or empty (CLI default = all).
+pub fn allowed_tools_spawn_flags(tools: &[String]) -> Vec<String> {
+    let cleaned = normalize_allowed_tools(tools);
+    if cleaned.is_empty() {
+        return Vec::new();
+    }
+    vec!["--tools".into(), cleaned.join(",")]
+}
+
+/// Order-independent, case-insensitive equality for soft-respawn flip checks.
+pub fn allowed_tools_equal(a: &[String], b: &[String]) -> bool {
+    disallowed_tools_equal(a, b)
+}
+
+pub fn no_plan_spawn_flags(plan_enabled: bool) -> Vec<&'static str> {
+    if plan_enabled {
+        vec![]
+    } else {
+        vec!["--no-plan"]
+    }
+}
+
+pub fn leader_spawn_flag(use_leader: bool) -> &'static str {
+    if use_leader {
+        "--leader"
+    } else {
+        "--no-leader"
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSpawnSpec {
+    pub name: String,
+}
+
+impl AgentSpawnSpec {
+    pub fn from_setting(raw: &str) -> Option<Self> {
+        let name = crate::agents_catalog::normalize_preferred_agent(raw)?;
+        Some(Self { name })
+    }
+
+    pub fn cli_args(&self) -> [String; 2] {
+        ["--agent".into(), self.name.clone()]
+    }
+}
+
+pub fn preferred_agent_spawn_flags(raw: &str) -> Option<Vec<String>> {
+    crate::agents_catalog::agent_spawn_cli_args(raw)
+}
+
+/// Pure: agent-option `["--agent-profile", path]` when Settings path is set.
+pub fn agent_profile_spawn_flags(raw: &str) -> Option<Vec<String>> {
+    crate::agents_catalog::agent_profile_spawn_cli_args(raw)
+}
+
+/// Pure: top-level `["--agents", json]` when Settings agents JSON is set.
+pub fn agents_json_spawn_flags(raw: &str) -> Option<Vec<String>> {
+    crate::agents_catalog::agents_json_spawn_cli_args(raw)
+}
 
 impl AcpClient {
     /// Effective sandbox profile this process was spawned with (reuse gate).
@@ -531,52 +1042,33 @@ impl AcpClient {
             .unwrap_or(false)
     }
 
-    #[allow(dead_code)]
-    pub async fn spawn(
+    pub fn spawn(
         cli_path: PathBuf,
         cwd: PathBuf,
-    ) -> Result<
-        (
-            Arc<Self>,
-            mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>,
-        ),
-        AgentError,
-    > {
-        Self::spawn_with_options(cli_path, cwd, SpawnOptions::default()).await
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>), AgentError> {
+        Self::spawn_with_options(cli_path, cwd, SpawnOptions::default())
     }
 
-    pub async fn spawn_with_options(
+    pub fn spawn_with_options(
         cli_path: PathBuf,
         cwd: PathBuf,
         opts: SpawnOptions,
-    ) -> Result<
-        (
-            Arc<Self>,
-            mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>,
-        ),
-        AgentError,
-    > {
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>), AgentError> {
         let settings = crate::store::load_settings();
-        Self::spawn_with_home(cli_path, cwd, &settings.session_data_mode, opts).await
+        Self::spawn_with_home(cli_path, cwd, &settings.session_data_mode, opts)
     }
 
     /// Spawn `grok agent stdio` with GROK_HOME from session_data_mode.
-    pub async fn spawn_with_home(
+    pub fn spawn_with_home(
         cli_path: PathBuf,
         cwd: PathBuf,
         session_data_mode: &str,
         opts: SpawnOptions,
-    ) -> Result<
-        (
-            Arc<Self>,
-            mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>,
-        ),
-        AgentError,
-    > {
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>), AgentError> {
         // API mode: if an ACP server address is configured, connect over TCP
         // instead of spawning a local CLI. The server drives an agent running
         // elsewhere (WSL/SSH/container) but speaks the identical ACP protocol.
-        // Priority: TCP > SSH wrap > WSL spawn > native spawn.
+        // Priority: TCP > WSL spawn > native spawn.
         let settings_early = crate::store::load_settings();
         if let Some(addr) = settings_early
             .acp_server_addr
@@ -584,30 +1076,17 @@ impl AcpClient {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return Self::connect_tcp(addr, cwd).await;
+            return Self::connect_tcp(addr, cwd);
         }
 
-        let ssh_alias = opts
-            .ssh_alias
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && crate::ssh_remote::is_safe_ssh_alias(s))
-            .map(|s| s.to_string());
-
-        let wsl_launch = if ssh_alias.is_some() {
-            None
-        } else {
-            crate::wsl_backend::resolve_wsl_launch(&settings_early)
-        };
+        let wsl_launch = crate::wsl_backend::resolve_wsl_launch(&settings_early);
         let cli_path = if let Some(ref w) = wsl_launch {
             crate::wsl_backend::wsl_display_path(w)
-        } else if ssh_alias.is_some() {
-            std::path::PathBuf::from("grok")
         } else {
             cli_path
         };
 
-        if ssh_alias.is_none() && wsl_launch.is_none() && !cli_path.exists() {
+        if wsl_launch.is_none() && !cli_path.exists() {
             return Err(AgentError::new(
                 AgentErrorCode::CliNotFound,
                 format!("CLI not found: {}", cli_path.display()),
@@ -624,9 +1103,7 @@ impl AcpClient {
         // 0.2.x-specific; an older CLI rejects it and dies, which the user only
         // ever sees as AGENT_CRASHED with no hint that the CLI is the problem.
         // Unknown/unparseable versions pass through — fail open, not closed.
-        let version_raw = if ssh_alias.is_some() {
-            None
-        } else if let Some(ref w) = wsl_launch {
+        let version_raw = if let Some(ref w) = wsl_launch {
             crate::wsl_backend::read_wsl_version(w)
         } else {
             crate::cli_probe::read_version_of(&cli_path)
@@ -656,112 +1133,40 @@ impl AcpClient {
         //   Flags after `stdio` are rejected (`unexpected argument '--model'`).
         //   `--permission-mode` is top-level `grok` only — not under `grok agent`.
         let empty_mcp_servers = opts.empty_mcp_servers;
-        let app_session_id = opts.app_session_id.clone();
         let home_override = opts.grok_home_override.clone();
+        let grok_home = if let Some(ref h) = home_override {
+            h.clone()
+        } else {
+            crate::paths::resolve_agent_grok_home(session_data_mode)
+        };
+        let _ = std::fs::create_dir_all(&grok_home);
         // Route class is process-scoped (auth material + config.toml). Official
         // aux override home is always OIDC-side; main home follows active_route.
-        // Custom relays live only in agent-home — force that GROK_HOME even when
-        // session_data_mode=shared so third-party keys work without official login (#557).
-        let explicit_route = opts
-            .route_provider_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
         let custom_route = if home_override.is_some() {
             false
-        } else if let Some(ref id) = explicit_route {
-            !crate::providers::is_session_provider_official(id)
         } else {
             matches!(
                 crate::providers::active_route(),
                 crate::providers::ActiveRoute::Custom { .. }
             )
         };
-        let route_provider_id = match explicit_route {
-            Some(id) if crate::providers::is_session_provider_official(&id) => {
-                crate::providers::SESSION_PROVIDER_OFFICIAL.to_string()
-            }
-            Some(id) => id,
-            None => match crate::providers::active_route() {
-                crate::providers::ActiveRoute::Custom { id } => id,
-                crate::providers::ActiveRoute::Official => {
-                    crate::providers::SESSION_PROVIDER_OFFICIAL.to_string()
-                }
-            },
-        };
-        let grok_home = if let Some(ref h) = home_override {
-            h.clone()
-        } else {
-            crate::paths::resolve_inference_grok_home(session_data_mode, custom_route)
-        };
-        // Host-side mkdir only for native/SSH homes. WSL GROK_HOME is Linux-native
-        // (`~/.grok` in the distro) and is created via `wsl --exec mkdir -p`.
-        if wsl_launch.is_none() {
-            let _ = std::fs::create_dir_all(&grok_home);
-        }
-        // Prep agent-home when independent *or* custom (shared+custom still uses agent-home).
         // Side-channel with explicit home: never touch main agent-home auth.
-        // WSL agents use a Linux-native GROK_HOME — skip Windows agent-home rewrites
-        // and agent-proc snapshots (those would land on /mnt and break sandbox binds).
-        let agent_home_prep = ssh_alias.is_none()
-            && home_override.is_none()
-            && wsl_launch.is_none()
-            && crate::paths::needs_agent_home_spawn_prep(session_data_mode, custom_route);
-        // Preference syncs write independent-only; for shared+custom force independent
-        // so agent-home receives permission / feature pins the relay process needs.
-        let prep_mode = if custom_route {
-            "independent"
-        } else {
-            session_data_mode
-        };
-        // Hold across canonical auth/config writes and the private GROK_HOME
-        // snapshot. The child and its nested tools read the snapshot, so the
-        // lock does not have to outlive spawn (#1293).
-        let route_auth_guard = crate::providers::route_auth_lock().lock().await;
-        if agent_home_prep {
-            crate::providers::prepare_route_auth(custom_route);
+        if home_override.is_none() && session_data_mode != "shared" {
+            // Official → sync OIDC; custom → strip auth.json (api_key only).
+            crate::providers::prepare_route_auth_for_agent();
             if let Some(ref pol) = opts.permission_policy {
-                let _ = crate::agent_prefs::sync_permission_to_agent_profile(prep_mode, pol);
+                let _ =
+                    crate::agent_prefs::sync_permission_to_agent_profile(session_data_mode, pol);
             }
         }
 
         // Composer may hold a catalog id while the active channel is a custom
         // provider — resolve to the route id Grok Build actually understands.
         // Override home (official aux): pass model id through as catalog id.
-        let grok_build_proxy = if ssh_alias.is_some() || home_override.is_some() {
-            None
-        } else if opts.route_provider_id.is_some() {
-            // This chat's provider only. A global proxy default must not attach
-            // to an official chat, and a proxy section must still bind when it
-            // is not `[models].default`.
-            crate::providers::session_grok_build_proxy_spawn(
-                &route_provider_id,
-                opts.model_id.as_deref().unwrap_or(""),
-            )
-        } else {
-            crate::providers::active_grok_build_proxy_spawn(opts.model_id.as_deref().unwrap_or(""))
-        };
-        let spawn_model = if ssh_alias.is_some() {
-            let m = opts.model_id.as_deref().unwrap_or("").trim();
-            if m.is_empty() || crate::providers::is_custom_provider_id(m) {
-                crate::providers::OFFICIAL_CATALOG_MODEL.to_string()
-            } else {
-                m.to_string()
-            }
-        } else if let Some(ref native) = grok_build_proxy {
-            native.model.clone()
-        } else if home_override.is_some() {
+        let spawn_model = if home_override.is_some() {
             let m = opts.model_id.as_deref().unwrap_or("").trim();
             if m.is_empty() {
                 crate::providers::OFFICIAL_CATALOG_MODEL.to_string()
-            } else {
-                m.to_string()
-            }
-        } else if opts.route_provider_id.is_some() {
-            let m = opts.model_id.as_deref().unwrap_or("").trim();
-            if m.is_empty() || custom_route {
-                route_provider_id.clone()
             } else {
                 m.to_string()
             }
@@ -801,9 +1206,7 @@ impl AcpClient {
         let auto_wake_enabled = settings.auto_wake_enabled;
         let two_pass_compaction = settings.two_pass_compaction_enabled;
         let memory_enabled = settings.experimental_memory;
-        // SSH Wave 4 always asks for --leader. The remote script fail-opens to
-        // --no-leader if `~/.grok/leader.sock` never appears.
-        let use_leader = ssh_alias.is_some() || settings.use_leader;
+        let use_leader = settings.use_leader;
         let plan_enabled = settings.plan_enabled;
         let disable_web = settings.disable_web_search;
         // Session override wins when set; else global Settings.
@@ -832,51 +1235,43 @@ impl AcpClient {
         } else {
             None
         };
-        // Sealed homes link sessions/memory/skills out of `$GROK_HOME`. The
-        // built-in profile cannot grow extra write roots, so the CLI flag is a
-        // wrapper defined in the sealed sandbox.toml (#1341). Process reuse
-        // still compares the profile the user asked for.
-        let sandbox_cli = sandbox.as_ref().map(|sb| {
-            let mut cli = sb.clone();
-            if agent_home_prep {
-                cli.profile = crate::agent_proc_home::sealed_share_spawn_profile(&sb.profile);
-            }
-            cli
-        });
         // Soft-fail older CLIs for GROK_SUBAGENT_WORKTREE_SNAPSHOT env.
         let cli_ver = version_raw.clone();
 
-        if agent_home_prep {
+        if session_data_mode != "shared" {
             let _ = crate::agent_subagents::sync_subagents_to_agent_profile(
-                prep_mode,
+                session_data_mode,
                 subagents_enabled,
             );
-            let _ = crate::agent_memory::sync_memory_to_agent_profile(prep_mode, memory_enabled);
+            let _ = crate::agent_memory::sync_memory_to_agent_profile(
+                session_data_mode,
+                memory_enabled,
+            );
             let _ = crate::agent_todo_gate::sync_todo_gate_to_agent_profile(
-                prep_mode,
+                session_data_mode,
                 todo_gate_enabled,
                 todo_gate_max_fires,
             );
             let _ = crate::agent_subagent_wt_snap::sync_subagent_wt_snap_to_agent_profile(
-                prep_mode,
+                session_data_mode,
                 subagent_wt_snap,
             );
             let _ = crate::agent_auto_wake::sync_auto_wake_to_agent_profile(
-                prep_mode,
+                session_data_mode,
                 auto_wake_enabled,
             );
             let _ = crate::agent_two_pass_compaction::sync_two_pass_compaction_to_agent_profile(
-                prep_mode,
+                session_data_mode,
                 two_pass_compaction,
             );
             // Custom + inject: PreToolUse hook blocks native Imagine (ACP ignores
             // --disallowed-tools which is headless-only). Official route / inject
             // off removes the managed hook file.
-            let _ = crate::official_aux::sync_native_media_block_hook_for_current(prep_mode);
-            let _ = crate::extensions::sync_user_mcp_for_official_aux_inject(prep_mode);
+            let _ =
+                crate::official_aux::sync_native_media_block_hook_for_current(session_data_mode);
             // Heal duplicate keys left by older upsert bugs (e.g. yolo vs yolo_mode).
             // Valid configs are never rewritten. Soft-fail so spawn still attempts.
-            match crate::agent_home_config::ensure_agent_home_config_sane(prep_mode) {
+            match crate::agent_home_config::ensure_agent_home_config_sane(session_data_mode) {
                 Ok(report) if report.changed => {
                     tracing::info!(
                         target: "acp_client",
@@ -896,30 +1291,22 @@ impl AcpClient {
             }
         }
 
-        // Native: `grok …`; WSL: `wsl.exe [-d] --cd <linux_cwd> --exec <linux_cli> …`
-        // SSH: collect grok flags first, then wrap as one remote `ssh -T` script.
-        // OpenSSH joins the remote command into a single `-c` string — extra
-        // argv after `bash -lc` is not a real argv array on the host.
+        // Native: `grok …`; WSL: `wsl.exe [-d] --cd <linux_cwd> -- <linux_cli> …`
         // (env vars set on the Windows process and forwarded via WSLENV).
-        let mut cmd = if ssh_alias.is_some() {
-            Command::new("grok")
-        } else if let Some(ref w) = wsl_launch {
+        let mut cmd = if let Some(ref w) = wsl_launch {
             let linux_cwd = crate::wsl_backend::windows_path_to_wsl(&cwd).map_err(|e| {
                 AgentError::new(
                     AgentErrorCode::CliNotFound,
                     format!("WSL cwd path map failed: {e}"),
                 )
             })?;
-            crate::wsl_backend::start_wsl_tokio_command(w, &linux_cwd)
-                .map_err(|e| AgentError::new(AgentErrorCode::CliNotFound, e))?
+            crate::wsl_backend::start_wsl_tokio_command(w, &linux_cwd).map_err(|e| {
+                AgentError::new(AgentErrorCode::CliNotFound, e)
+            })?
         } else {
             Command::new(&cli_path)
         };
         cmd.arg("--no-auto-update");
-        // Folder trust: required for headless AGENTS.md / project skills load.
-        for f in folder_trust_spawn_flags(opts.folder_trust) {
-            cmd.arg(f);
-        }
         // Compaction mode/detail (CLI 0.2.117+): always set env; flags only when
         // the probed binary is known to accept them (soft-fail on older CLIs).
         let pass_compaction_flags = cli_supports_compaction_flags(cli_ver.as_deref());
@@ -933,7 +1320,7 @@ impl AcpClient {
         for a in permission_mode_spawn_flags(spawn_policy, spawn_product_mode) {
             cmd.arg(a);
         }
-        if let Some(ref sb) = sandbox_cli {
+        if let Some(ref sb) = sandbox {
             for a in sb.cli_args() {
                 cmd.arg(a);
             }
@@ -1014,37 +1401,13 @@ impl AcpClient {
             two_pass_compaction,
             cli_ver.as_deref(),
         );
-        crate::agent_auto_wake::apply_auto_wake_to_command(
-            &mut cmd,
-            auto_wake_enabled,
-            session_data_mode,
-        );
         cmd.arg("agent");
-        let local_native_spawn = ssh_alias.is_none() && wsl_launch.is_none();
-        let leader_flag = if local_native_spawn && use_leader {
-            let socket = crate::leader::default_leader_socket_path();
-            #[cfg(unix)]
-            let socket_present = {
-                use std::os::unix::fs::FileTypeExt;
-                std::fs::metadata(&socket)
-                    .map(|meta| meta.file_type().is_socket())
-                    .unwrap_or(false)
-            };
-            #[cfg(not(unix))]
-            let socket_present = socket.exists();
-            local_leader_spawn_flag(use_leader, socket_present)
-        } else {
-            leader_spawn_flag(use_leader)
-        };
-        cmd.arg(leader_flag);
+        cmd.arg(leader_spawn_flag(use_leader));
         // Agent option: `--agent-profile <PATH>` (before `stdio`). Path only —
-        // does not rewrite app agent-home or shared ~/.grok. Skip on SSH — the
-        // path is local and would not exist on the host.
-        if ssh_alias.is_none() {
-            if let Some(ref profile_path) = agent_profile {
-                cmd.arg("--agent-profile");
-                cmd.arg(profile_path);
-            }
+        // does not rewrite app agent-home or shared ~/.grok.
+        if let Some(ref profile_path) = agent_profile {
+            cmd.arg("--agent-profile");
+            cmd.arg(profile_path);
         }
         if !spawn_model.is_empty() {
             cmd.args(["--model", &spawn_model]);
@@ -1066,132 +1429,25 @@ impl AcpClient {
             cmd.arg(a);
         }
         cmd.arg("stdio");
-        if let Some(ref alias) = ssh_alias {
-            let grok_args: Vec<String> = cmd
-                .as_std()
-                .get_args()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            cmd = crate::ssh_remote::start_ssh_acp_command(
-                alias,
-                cwd.to_string_lossy().as_ref(),
-                &grok_args,
-            )
-            .map_err(|e| AgentError::new(AgentErrorCode::ConnectFailed, e))?;
-        }
-        // Local native only: process-group + no-window so Windows tree-kill
-        // can reap tool/shell grandchildren. SSH/WSL keep CREATE_NO_WINDOW
-        // alone — do not apply local process-group / taskkill semantics.
-        let owns_local_process_tree = local_native_spawn;
-        if owns_local_process_tree {
+        if wsl_launch.is_none() {
             cmd.current_dir(&cwd);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        if owns_local_process_tree {
-            crate::process_util::apply_process_group_no_window_tokio(&mut cmd);
-        } else {
-            crate::process_util::apply_no_window_tokio(&mut cmd);
-        }
-        if owns_local_process_tree {
+        crate::process_util::apply_no_window_tokio(&mut cmd);
+        if wsl_launch.is_none() {
             crate::process_util::ensure_home_env_tokio(&mut cmd);
             if let Some(path) = crate::process_util::enriched_path_env() {
                 cmd.env("PATH", path);
             }
         }
-        // agent-home is shared by every independent official chat and every
-        // custom chat. Seal a private directory so one spawn cannot replace
-        // the other's auth.json while nested tools are still reading it.
-        let proc_home = if agent_home_prep {
-            // Last writer before the sealed copy. Shared ~/.grok is not this path.
-            let _ = crate::providers::ensure_custom_ids_in_allowed_models();
-            match crate::agent_proc_home::create(&grok_home, custom_route) {
-                Ok(dir) => {
-                    if let Some(sb) = sandbox.as_ref() {
-                        if let Err(e) = crate::agent_proc_home::install_sealed_share_grant(
-                            &dir,
-                            &grok_home,
-                            &sb.profile,
-                        ) {
-                            crate::agent_proc_home::discard(&dir);
-                            drop(route_auth_guard);
-                            return Err(AgentError::new(
-                                AgentErrorCode::ConnectFailed,
-                                format!("failed to grant sealed session directories: {e}"),
-                            ));
-                        }
-                    }
-                    Some(dir)
-                }
-                Err(e) => {
-                    drop(route_auth_guard);
-                    return Err(AgentError::new(
-                        AgentErrorCode::ConnectFailed,
-                        format!("failed to prepare a private agent home: {e}"),
-                    ));
-                }
-            }
-        } else {
-            None
-        };
-        let grok_home = proc_home.clone().unwrap_or(grok_home);
-        let grok_home = if let Some(ref w) = wsl_launch {
-            if home_override.is_some() {
-                // Isolated aux home is still a Windows path; map to /mnt for the
-                // Linux process (aux spawn forces sandbox off).
-                match crate::wsl_backend::windows_path_to_wsl(&grok_home) {
-                    Ok(linux) => std::path::PathBuf::from(linux),
-                    Err(e) => {
-                        if let Some(ref dir) = proc_home {
-                            crate::agent_proc_home::discard(dir);
-                        }
-                        return Err(AgentError::new(
-                            AgentErrorCode::ConnectFailed,
-                            format!("WSL GROK_HOME override map failed: {e}"),
-                        ));
-                    }
-                }
-            } else {
-                match crate::wsl_backend::ensure_linux_grok_home(
-                    w,
-                    settings.wsl_grok_home.as_deref(),
-                    &crate::process_util::user_home().join(".grok"),
-                ) {
-                    Ok(linux) => std::path::PathBuf::from(linux),
-                    Err(e) => {
-                        if let Some(ref dir) = proc_home {
-                            crate::agent_proc_home::discard(dir);
-                        }
-                        return Err(AgentError::new(
-                            AgentErrorCode::ConnectFailed,
-                            format!("WSL Linux GROK_HOME failed: {e}"),
-                        ));
-                    }
-                }
-            }
-        } else {
-            grok_home
-        };
-        let discard_proc_home = || {
-            if let Some(ref dir) = proc_home {
-                crate::agent_proc_home::discard(dir);
-            }
-        };
-        if ssh_alias.is_none() {
-            cmd.env("GROK_HOME", &grok_home);
-        }
-        if let Some(ref native) = grok_build_proxy {
-            apply_grok_build_proxy_env(&mut cmd, native);
-        }
+        cmd.env("GROK_HOME", &grok_home);
         // Do NOT set GROK_IMAGE_DESCRIPTION_MODEL / GROK_WEB_SEARCH_MODEL on the
         // main agent process: when main is DeepSeek, those envs make CLI send
-        // model id `grok-4.5` to the DeepSeek base_url (400). Generic custom
-        // routes use Host prepare_agent_prompt + optional MCP official-aux;
-        // grok_build_proxy gets search/X through the native catalog env above.
-        // Attachment semantics are unchanged: ACP still sends @path text, not
-        // a native image content block.
+        // model id `grok-4.5` to the DeepSeek base_url (400). Vision/search/X
+        // go through Host prepare_agent_prompt + MCP official-aux instead.
         //
         // Always disable Claude/Cursor MCP compat for App agent-home sessions.
         // Grok merges ~/.claude.json / Cursor MCP by default; those hang for ~30s
@@ -1204,28 +1460,23 @@ impl AcpClient {
         // Route agent traffic through the configured proxy (NEW-02). Windows
         // system proxy is registry-only and never reaches children as env vars.
         crate::proxy::apply_to_tokio_command(&mut cmd);
-        if let Some(ref sb) = sandbox_cli {
+        if let Some(ref sb) = sandbox {
             let (k, v) = sb.env_pair();
             cmd.env(k, v);
         }
-        // Forward selected env into the Linux process (GROK_HOME as-is, no /p).
+        // Forward selected env into the Linux process (path-translate GROK_HOME).
         if wsl_launch.is_some() {
             crate::wsl_backend::apply_wslenv(&mut cmd);
         }
         tracing::info!(
-            "acp: spawn home={} ssh={:?} mode={} model={} effort={:?} native_grok_proxy={} sandbox={:?} max_turns={:?} fork_session={} no_ask_user={} leader_requested={} leader_flag={} subagents={} memory={} compaction_mode={} compaction_detail={} compaction_flags={} agent_profile={:?} agents_json={}",
+            "acp: spawn home={} mode={} sandbox={:?} max_turns={:?} fork_session={} no_ask_user={} leader={} subagents={} memory={} compaction_mode={} compaction_detail={} compaction_flags={} agent_profile={:?} agents_json={}",
             grok_home.display(),
-            ssh_alias,
             session_data_mode,
-            spawn_model,
-            opts.effort,
-            grok_build_proxy.is_some(),
             sandbox.as_ref().map(|s| s.profile.as_str()),
             max_turns.as_ref().map(|m| m.turns),
             opts.fork_session,
             no_ask_user,
             use_leader,
-            leader_flag,
             subagents_enabled,
             memory_enabled,
             normalize_compaction_mode(&compaction_mode),
@@ -1240,41 +1491,27 @@ impl AcpClient {
         );
 
         let mut child = cmd.spawn().map_err(|e| {
-            drop(route_auth_guard);
-            discard_proc_home();
-            let code = if ssh_alias.is_some() {
-                AgentErrorCode::ConnectFailed
-            } else {
-                AgentErrorCode::CliNotFound
-            };
-            AgentError::new(code, format!("failed to spawn grok agent stdio: {e}"))
+            AgentError::new(
+                AgentErrorCode::CliNotFound,
+                format!("failed to spawn grok agent stdio: {e}"),
+            )
         })?;
 
-        // Capture PID before pipes / reader tasks take ownership of the child.
-        let child_pid = child.id();
-        tracing::info!(
-            pid = ?child_pid,
-            local_tree = owns_local_process_tree,
-            "acp: spawned child"
-        );
-
-        let stdin = child.stdin.take().ok_or_else(|| {
-            discard_proc_home();
-            AgentError::new(AgentErrorCode::AgentCrashed, "no stdin on child")
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            discard_proc_home();
-            AgentError::new(AgentErrorCode::AgentCrashed, "no stdout on child")
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            discard_proc_home();
-            AgentError::new(AgentErrorCode::AgentCrashed, "no stderr on child")
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AgentError::new(AgentErrorCode::AgentCrashed, "no stdin on child"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AgentError::new(AgentErrorCode::AgentCrashed, "no stdout on child"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AgentError::new(AgentErrorCode::AgentCrashed, "no stderr on child"))?;
 
         let client = Arc::new(Self {
             child: AsyncMutex::new(Some(child)),
-            child_pid,
-            owns_local_process_tree,
             stdin: AsyncMutex::new(Some(Box::new(stdin) as Box<dyn AsyncWrite + Unpin + Send>)),
             next_id: AtomicU64::new(1),
             pending: ParkingMutex::new(HashMap::new()),
@@ -1284,19 +1521,11 @@ impl AcpClient {
             cwd,
             stopped: AtomicBool::new(false),
             reader_alive: AtomicBool::new(true),
-            reader_stop: Arc::new(Notify::new()),
             stderr_tail: ParkingMutex::new(Vec::new()),
-            last_update_by_session: ParkingMutex::new(HashMap::new()),
-            last_update_unstamped: ParkingMutex::new(None),
+            last_update_at: ParkingMutex::new(None),
             empty_mcp_servers,
-            app_session_id: app_session_id.clone(),
             sandbox_profile: ParkingMutex::new(sandbox.map(|sb| sb.profile.clone())),
             custom_route,
-            route_provider_id,
-            rewind_supported: ParkingMutex::new(None),
-            ssh_alias: ssh_alias.clone(),
-            wsl_active: wsl_launch.is_some(),
-            proc_home: std::sync::Mutex::new(proc_home),
         });
 
         client.start_read_loop(Box::new(stdout));
@@ -1334,46 +1563,30 @@ impl AcpClient {
     /// shared build host, or a `socat`-fronted CLI). No child process, no
     /// stderr stream; the read half is wired to the same line reader.
     ///
-    /// Connect to an ACP server without blocking a Tokio worker. The explicit
-    /// connect deadline is important for unreachable/half-open API endpoints:
-    /// a synchronous `std::net::TcpStream::connect` here used to hold the
-    /// session connect lock and starve every other chat until the OS timeout.
-    pub async fn connect_tcp(
+    /// Sync (uses a blocking connect + `from_std`) to match `spawn_with_home`;
+    /// must be called from within the Tokio runtime.
+    pub fn connect_tcp(
         addr: &str,
         cwd: PathBuf,
-    ) -> Result<
-        (
-            Arc<Self>,
-            mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>,
-        ),
-        AgentError,
-    > {
-        const ACP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-        let stream = tokio::time::timeout(ACP_CONNECT_TIMEOUT, TcpStream::connect(addr))
-            .await
-            .map_err(|_| {
-                AgentError::new(
-                    AgentErrorCode::CliNotFound,
-                    format!(
-                        "ACP server connect timed out after {}s: {addr}",
-                        ACP_CONNECT_TIMEOUT.as_secs()
-                    ),
-                )
-            })?
-            .map_err(|e| {
-                AgentError::new(
-                    AgentErrorCode::CliNotFound,
-                    format!("failed to connect ACP server {addr}: {e}"),
-                )
-            })?;
+    ) -> Result<(Arc<Self>, mpsc::UnboundedReceiver<(Option<String>, AcpEvent)>), AgentError> {
+        let std_stream = std::net::TcpStream::connect(addr).map_err(|e| {
+            AgentError::new(
+                AgentErrorCode::CliNotFound,
+                format!("failed to connect ACP server {addr}: {e}"),
+            )
+        })?;
+        std_stream.set_nonblocking(true).map_err(|e| {
+            AgentError::new(AgentErrorCode::AgentCrashed, format!("socket setup: {e}"))
+        })?;
+        let stream = TcpStream::from_std(std_stream).map_err(|e| {
+            AgentError::new(AgentErrorCode::AgentCrashed, format!("socket adopt: {e}"))
+        })?;
         let _ = stream.set_nodelay(true);
         let (read_half, write_half) = stream.into_split();
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let client = Arc::new(Self {
             child: AsyncMutex::new(None),
-            child_pid: None,
-            owns_local_process_tree: false,
             stdin: AsyncMutex::new(Some(
                 Box::new(write_half) as Box<dyn AsyncWrite + Unpin + Send>
             )),
@@ -1385,21 +1598,13 @@ impl AcpClient {
             cwd,
             stopped: AtomicBool::new(false),
             reader_alive: AtomicBool::new(true),
-            reader_stop: Arc::new(Notify::new()),
             stderr_tail: ParkingMutex::new(Vec::new()),
-            last_update_by_session: ParkingMutex::new(HashMap::new()),
-            last_update_unstamped: ParkingMutex::new(None),
+            last_update_at: ParkingMutex::new(None),
             // TCP connect path keeps default MCP inject (not official side-channel).
             empty_mcp_servers: false,
-            app_session_id: None,
             sandbox_profile: ParkingMutex::new(None),
             // Remote ACP: treat as official-class for reuse (no local auth strip).
             custom_route: false,
-            route_provider_id: crate::providers::SESSION_PROVIDER_OFFICIAL.to_string(),
-            rewind_supported: ParkingMutex::new(None),
-            ssh_alias: None,
-            wsl_active: false,
-            proc_home: std::sync::Mutex::new(None),
         });
         client.start_read_loop(Box::new(read_half));
         Ok((client, event_rx))
@@ -1408,15 +1613,6 @@ impl AcpClient {
     /// Whether this process was spawned for a custom relay route (api_key only).
     pub fn is_custom_route(&self) -> bool {
         self.custom_route
-    }
-
-    /// `official` or the custom section id this process was spawned for.
-    pub fn route_provider_id(&self) -> &str {
-        if self.route_provider_id.is_empty() {
-            crate::providers::SESSION_PROVIDER_OFFICIAL
-        } else {
-            &self.route_provider_id
-        }
     }
 
     /// Spawn the transport read loop over any `AsyncRead` (child stdout or the
@@ -1429,15 +1625,8 @@ impl AcpClient {
             let mut reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
             let mut line = String::new();
             loop {
-                if !c.reader_alive.load(Ordering::SeqCst) {
-                    return;
-                }
                 line.clear();
-                let read = tokio::select! {
-                    _ = c.reader_stop.notified() => return,
-                    result = reader.read_line(&mut line) => result,
-                };
-                match read {
+                match reader.read_line(&mut line).await {
                     Ok(0) => break,
                     Ok(_) => {
                         let trimmed = line.trim();
@@ -1452,29 +1641,10 @@ impl AcpClient {
                     }
                 }
             }
-            // Do not turn an intentional kill into a second, late
-            // `ProcessExited` event. The owner already transitioned the
-            // session during `kill()`.
-            if !c.reader_alive.swap(false, Ordering::SeqCst) {
-                return;
-            }
-            // Stdout EOF normally follows child termination. Capture the
-            // status when it is already available so the Host can distinguish
-            // a clean/failed CLI exit from a remote TCP EOF. `try_wait` keeps
-            // the reader task bounded if a malformed child leaves the handle
-            // alive after closing stdout.
-            let exit_code = {
-                let mut child = c.child.lock().await;
-                child
-                    .as_mut()
-                    .and_then(|process| process.try_wait().ok().flatten())
-                    .and_then(|status| status.code())
-            };
+            c.reader_alive.store(false, Ordering::SeqCst);
             let detail = c.format_exit_detail("Agent stream closed (EOF)");
             c.fail_all_pending(&detail);
-            let _ = c
-                .event_tx
-                .send((None, AcpEvent::ProcessExited { code: exit_code }));
+            let _ = c.event_tx.send((None, AcpEvent::ProcessExited { code: None }));
         });
     }
 
@@ -1545,12 +1715,9 @@ impl AcpClient {
                     // Must still surface the error — do not drop as "unknown id".
                     let full = format_jsonrpc_error(err);
                     warn!("acp late error response id={id} (pending already resolved): {full}");
-                    let _ = self.event_tx.send((
-                        None,
-                        AcpEvent::Error {
-                            error: classify_rpc_error(&full),
-                        },
-                    ));
+                    let _ = self.event_tx.send((None, AcpEvent::Error {
+                        error: classify_rpc_error(&full),
+                    }));
                 } else {
                     debug!(
                         "acp late ok response id={id} (pending already resolved); keys={:?}",
@@ -1596,42 +1763,27 @@ impl AcpClient {
                             .and_then(|v| v.as_u64())
                             .filter(|n| *n > 0)
                     };
-                    let _ = self.event_tx.send((
-                        None,
-                        AcpEvent::UsageReported {
-                            total_tokens: u64_field("totalTokens", "total_tokens"),
-                            input_tokens: u64_field("inputTokens", "input_tokens"),
-                            output_tokens: u64_field("outputTokens", "output_tokens"),
-                            system_tokens: None,
-                            tools_tokens: None,
-                            history_tokens: None,
-                            cached_read_tokens: u64_field(
-                                "cachedReadTokens",
-                                "cache_read_input_tokens",
-                            ),
-                            cache_creation_tokens: u64_field(
-                                "cacheCreationTokens",
-                                "cache_creation_input_tokens",
-                            ),
-                            reasoning_tokens: u64_field("reasoningTokens", "reasoning_tokens"),
-                            cost_usd_ticks: u64_field("costUsdTicks", "cost_usd_ticks"),
-                            model_calls: u64_field("modelCalls", "model_calls"),
-                            api_duration_ms: u64_field("apiDurationMs", "api_duration_ms"),
-                            cost_is_partial: usage
-                                .get("costIsPartial")
-                                .or_else(|| usage.get("cost_is_partial"))
-                                .and_then(|v| v.as_bool()),
-                            usage_is_incomplete: usage
-                                .get("usageIsIncomplete")
-                                .or_else(|| usage.get("usage_is_incomplete"))
-                                .and_then(|v| v.as_bool()),
-                            context_window: None,
-                            percentage: None,
-                            // Distinct from sessionUpdate `turn_completed` so
-                            // the UI does not double-count the same turn.
-                            source: "prompt_result".to_string(),
-                        },
-                    ));
+                    let _ = self.event_tx.send((None, AcpEvent::UsageReported {
+                        total_tokens: u64_field("totalTokens", "total_tokens"),
+                        input_tokens: u64_field("inputTokens", "input_tokens"),
+                        output_tokens: u64_field("outputTokens", "output_tokens"),
+                        system_tokens: None,
+                        tools_tokens: None,
+                        history_tokens: None,
+                        cached_read_tokens: u64_field(
+                            "cachedReadTokens",
+                            "cache_read_input_tokens",
+                        ),
+                        cache_creation_tokens: u64_field(
+                            "cacheCreationTokens",
+                            "cache_creation_input_tokens",
+                        ),
+                        reasoning_tokens: u64_field("reasoningTokens", "reasoning_tokens"),
+                        cost_usd_ticks: u64_field("costUsdTicks", "cost_usd_ticks"),
+                        context_window: None,
+                        percentage: None,
+                        source: "turn_completed".to_string(),
+                    }));
                 }
                 return;
             }
@@ -1672,15 +1824,12 @@ impl AcpClient {
                             "acp exit_plan_mode id={rpc_id} plan_chars={}",
                             plan_content.as_ref().map(|s| s.len()).unwrap_or(0)
                         );
-                        let _ = self.event_tx.send((
-                            None,
-                            AcpEvent::Plan {
-                                entries: params.get("entries").cloned().unwrap_or(json!([])),
-                                body: plan_content,
-                                rpc_id: Some(rpc_id),
-                                tool_call_id,
-                            },
-                        ));
+                        let _ = self.event_tx.send((None, AcpEvent::Plan {
+                            entries: params.get("entries").cloned().unwrap_or(json!([])),
+                            body: plan_content,
+                            rpc_id: Some(rpc_id),
+                            tool_call_id,
+                        }));
                     } else {
                         // ask_user_question: surface UI; reply via respond_ask_user_question.
                         let parsed = parse_ask_user_question_params(&params);
@@ -1701,15 +1850,12 @@ impl AcpClient {
                                 warn!("failed to auto-cancel empty ask_user_question: {e}");
                             }
                         } else {
-                            let _ = self.event_tx.send((
-                                None,
-                                AcpEvent::AskUserQuestion {
-                                    rpc_id,
-                                    tool_call_id: parsed.tool_call_id,
-                                    questions: parsed.questions,
-                                    raw: params,
-                                },
-                            ));
+                            let _ = self.event_tx.send((None, AcpEvent::AskUserQuestion {
+                                rpc_id,
+                                tool_call_id: parsed.tool_call_id,
+                                questions: parsed.questions,
+                                raw: params,
+                            }));
                         }
                     }
                     return;
@@ -1742,13 +1888,10 @@ impl AcpClient {
                         .or_else(|| msg.pointer("/params/session_id"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    let _ = self.event_tx.send((
-                        sid.clone(),
-                        AcpEvent::PromptComplete {
-                            stop_reason: stop.clone(),
-                            authoritative: false,
-                        },
-                    ));
+                    let _ = self.event_tx.send((sid.clone(), AcpEvent::PromptComplete {
+                        stop_reason: stop.clone(),
+                        authoritative: false,
+                    }));
                     // Grace period: free waiters only if the RPC result never arrives.
                     self.schedule_prompt_complete_fallback(sid, stop);
                 } else {
@@ -1774,23 +1917,11 @@ impl AcpClient {
         }
     }
 
-    fn touch_last_update(&self, session_id: Option<&str>, at: Instant) {
-        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
-            self.last_update_by_session
-                .lock()
-                .insert(sid.to_string(), at);
-        } else {
-            *self.last_update_unstamped.lock() = Some(at);
-        }
-    }
-
-    fn last_update_for(&self, session_id: Option<&str>) -> Option<Instant> {
-        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
-            if let Some(t) = self.last_update_by_session.lock().get(sid).copied() {
-                return Some(t);
-            }
-        }
-        *self.last_update_unstamped.lock()
+    /// Whether a `session/prompt` request is still awaiting its RPC result.
+    fn has_pending_prompt_for(&self, session_id: Option<&str>) -> bool {
+        self.pending.lock().values().any(|p| {
+            p.method == "session/prompt" && pending_prompt_matches(p.session_id.as_deref(), session_id)
+        })
     }
 
     /// Release the `session/prompt` waiter only once the agent has actually gone
@@ -1805,29 +1936,18 @@ impl AcpClient {
     /// `session_id` (from the notification envelope) scopes the fallback to
     /// one session's pending prompt when a process hosts several concurrent
     /// turns — another chat's early complete must not free this waiter.
-    fn schedule_prompt_complete_fallback(
-        self: &Arc<Self>,
-        session_id: Option<String>,
-        stop_reason: String,
-    ) {
+    fn schedule_prompt_complete_fallback(self: &Arc<Self>, session_id: Option<String>, stop_reason: String) {
         let this = Arc::clone(self);
         let sid = session_id.as_deref().map(|s| s.to_string());
-        // Capture this completion notification's exact RPC generation. A real
-        // result may remove it before the timer wakes; a newer prompt in the
-        // same session must never be adopted by this stale fallback.
-        let prompt_ids = pending_prompt_ids_for(&self.pending.lock(), sid.as_deref());
-        if prompt_ids.is_empty() {
-            return;
-        }
         tokio::spawn(async move {
             let grace = Duration::from_millis(PROMPT_COMPLETE_FALLBACK_GRACE_MS);
             loop {
                 tokio::time::sleep(grace).await;
                 // Real RPC result landed (or the turn was cancelled) — nothing to free.
-                if !has_pending_prompt_ids(&this.pending.lock(), &prompt_ids) {
+                if !this.has_pending_prompt_for(sid.as_deref()) {
                     return;
                 }
-                let last = this.last_update_for(sid.as_deref());
+                let last = *this.last_update_at.lock();
                 if prompt_fallback_due(last, grace, Instant::now()) {
                     break;
                 }
@@ -1835,37 +1955,45 @@ impl AcpClient {
                     "acp prompt_complete fallback re-armed: agent still streaming after early complete"
                 );
             }
-            this.complete_pending_prompt_fallback(&prompt_ids, &stop_reason);
+            this.complete_pending_prompt_fallback(&sid, &stop_reason);
         });
     }
 
     /// If agent never returned a session/prompt result after prompt_complete, free waiters.
-    fn complete_pending_prompt_fallback(&self, prompt_ids: &[u64], stop_reason: &str) {
-        let prompts = take_pending_prompt_ids(&mut self.pending.lock(), prompt_ids);
-        for (id, p) in prompts {
-            info!(
-                "acp completing session/prompt id={id} via delayed prompt_complete fallback (no RPC result yet)"
-            );
-            let _ = p.tx.send(Ok(json!({ "stopReason": stop_reason })));
+    fn complete_pending_prompt_fallback(&self, session_id: &Option<String>, stop_reason: &str) {
+        let mut pending = self.pending.lock();
+        let prompt_ids: Vec<u64> = pending
+            .iter()
+            .filter(|(_, p)| {
+                p.method == "session/prompt"
+                    && pending_prompt_matches(p.session_id.as_deref(), session_id.as_deref())
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for id in prompt_ids {
+            if let Some(p) = pending.remove(&id) {
+                info!(
+                    "acp completing session/prompt id={id} via delayed prompt_complete fallback (no RPC result yet)"
+                );
+                let _ = p.tx.send(Ok(json!({ "stopReason": stop_reason })));
+            }
         }
     }
 
     fn handle_session_update(&self, params: &Value) {
         // Proof of life for the turn: re-arms the `prompt_complete` fallback so
         // an early completion notification cannot cut the answer short.
-        // Stamp per-session so another chat on this process cannot extend
-        // (or expire) this turn's grace window.
-        let sid = params
-            .get("sessionId")
-            .or_else(|| params.get("session_id"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        self.touch_last_update(sid.as_deref(), Instant::now());
+        *self.last_update_at.lock() = Some(Instant::now());
         // Multi-session routing: every update notification carries its
         // `sessionId` at params top level (Grok gateway envelope). Stamp the
         // decoded events so the SessionManager can route them to the right
         // App session when one process hosts several. Missing sid → None
         // (process-scoped fallback).
+        let sid = params
+            .get("sessionId")
+            .or_else(|| params.get("session_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         let events = decode_session_update(params);
         if events.is_empty() {
             let update = params.get("update").unwrap_or(params);
@@ -1937,21 +2065,8 @@ impl AcpClient {
                 let detail = self.format_exit_detail(&head);
                 error!("{detail}");
                 self.fail_all_pending(&detail);
-                let _ = self
-                    .event_tx
-                    .send((None, AcpEvent::ProcessExited { code: None }));
-                if tokio::time::timeout(
-                    std::time::Duration::from_secs(STDIN_WRITE_TIMEOUT_SECS),
-                    self.kill(),
-                )
-                .await
-                .is_err()
-                {
-                    tracing::warn!(
-                        secs = STDIN_WRITE_TIMEOUT_SECS,
-                        "acp kill after stdin timeout also timed out"
-                    );
-                }
+                let _ = self.event_tx.send((None, AcpEvent::ProcessExited { code: None }));
+                self.kill().await;
                 Err(head)
             }
         }
@@ -1967,15 +2082,6 @@ fn json_token_u64(obj: &Value, keys: &[&str]) -> Option<u64> {
                 .or_else(|| v.as_f64().map(|f| f.max(0.0) as u64))
         }) {
             return Some(n);
-        }
-    }
-    None
-}
-
-fn json_token_bool(obj: &Value, keys: &[&str]) -> Option<bool> {
-    for k in keys {
-        if let Some(b) = obj.get(*k).and_then(|v| v.as_bool()) {
-            return Some(b);
         }
     }
     None
@@ -2019,26 +2125,30 @@ pub fn parse_usage_update(kind: &str, update: &Value) -> Option<AcpEvent> {
     // on the same object (should not happen on live wire).
     let occupancy = json_token_u64(
         root,
-        &["tokens_used", "tokensUsed", "usedTokens", "used_tokens"],
+        &[
+            "tokens_used",
+            "tokensUsed",
+            "usedTokens",
+            "used_tokens",
+        ],
     );
-    let total = occupancy
-        .or_else(|| {
-            json_token_u64(
-                root,
-                &[
-                    "totalTokens",
-                    "total_tokens",
-                    "contextTokens",
-                    "context_tokens",
-                    "tokens",
-                    "total",
-                ],
-            )
-        })
-        .or_else(|| match (input, output) {
-            (Some(i), Some(o)) => Some(i.saturating_add(o)),
-            _ => None,
-        });
+    let total = occupancy.or_else(|| {
+        json_token_u64(
+            root,
+            &[
+                "totalTokens",
+                "total_tokens",
+                "contextTokens",
+                "context_tokens",
+                "tokens",
+                "total",
+            ],
+        )
+    })
+    .or_else(|| match (input, output) {
+        (Some(i), Some(o)) => Some(i.saturating_add(o)),
+        _ => None,
+    });
     let system = json_token_u64(root, &["systemTokens", "system_tokens", "system"]);
     let tools = json_token_u64(
         root,
@@ -2080,13 +2190,6 @@ pub fn parse_usage_update(kind: &str, update: &Value) -> Option<AcpEvent> {
     );
     let reasoning = json_token_u64(root, &["reasoningTokens", "reasoning_tokens"]);
     let cost_usd_ticks = json_token_u64(root, &["costUsdTicks", "cost_usd_ticks"]);
-    let model_calls = json_token_u64(root, &["modelCalls", "model_calls"]);
-    let api_duration_ms = json_token_u64(
-        root,
-        &["apiDurationMs", "api_duration_ms", "duration_api_ms"],
-    );
-    let cost_is_partial = json_token_bool(root, &["costIsPartial", "cost_is_partial"]);
-    let usage_is_incomplete = json_token_bool(root, &["usageIsIncomplete", "usage_is_incomplete"]);
     // CLI denominator + integer % (auto_compact_started / tokens_used).
     let context_window = json_token_u64(
         root,
@@ -2113,8 +2216,6 @@ pub fn parse_usage_update(kind: &str, update: &Value) -> Option<AcpEvent> {
         && cache_creation.is_none()
         && reasoning.is_none()
         && cost_usd_ticks.is_none()
-        && model_calls.is_none()
-        && api_duration_ms.is_none()
         && occupancy.is_none()
     {
         return None;
@@ -2137,9 +2238,9 @@ pub fn parse_usage_update(kind: &str, update: &Value) -> Option<AcpEvent> {
     // Normalize source so the frontend occupancy classifier matches CLI events.
     let source = if kind == "auto_compact_started" || kind.ends_with("auto_compact_started") {
         "auto_compact_started".to_string()
-    } else if kind == "tokens_used"
-        || (occupancy.is_some() && input.is_none() && output.is_none() && kind.is_empty())
-    {
+    } else if kind == "tokens_used" {
+        "tokens_used".to_string()
+    } else if occupancy.is_some() && input.is_none() && output.is_none() && kind.is_empty() {
         "tokens_used".to_string()
     } else {
         kind.to_string()
@@ -2156,10 +2257,6 @@ pub fn parse_usage_update(kind: &str, update: &Value) -> Option<AcpEvent> {
         cache_creation_tokens: cache_creation,
         reasoning_tokens: reasoning,
         cost_usd_ticks,
-        model_calls,
-        api_duration_ms,
-        cost_is_partial,
-        usage_is_incomplete,
         context_window,
         percentage,
         source,
@@ -2299,9 +2396,9 @@ impl AcpClient {
         }
     }
 
-    /// `session/prompt` wait: idle-based silence timeout, re-armed by every
-    /// `session/update`. No absolute turn-age ceiling — a fixed wall clock
-    /// killed healthy multi-image / multi-tool turns past 4 hours.
+    /// `session/prompt` wait: idle-based silence timeout (re-armed by every
+    /// `session/update`) plus an absolute ceiling. A fixed wall-clock timer
+    /// killed multi-tool turns that were still healthy past 10 minutes.
     async fn request_prompt(&self, params: Value) -> Result<Value, String> {
         let method = "session/prompt";
         if !self.reader_alive.load(Ordering::SeqCst) {
@@ -2324,7 +2421,7 @@ impl AcpClient {
             Pending {
                 method: method.to_string(),
                 tx,
-                session_id: prompt_sid.clone(),
+                session_id: prompt_sid,
             },
         );
         let msg = json!({
@@ -2341,8 +2438,9 @@ impl AcpClient {
 
         let wait_started = Instant::now();
         // Mark activity at dispatch so pure silence is measured from send time.
-        self.touch_last_update(prompt_sid.as_deref(), wait_started);
+        *self.last_update_at.lock() = Some(wait_started);
         let idle = Duration::from_secs(PROMPT_IDLE_TIMEOUT_SECS);
+        let absolute = Duration::from_secs(PROMPT_ABSOLUTE_TIMEOUT_SECS);
         let slice = Duration::from_secs(PROMPT_WAIT_SLICE_SECS);
         let mut rx = rx;
 
@@ -2376,18 +2474,26 @@ impl AcpClient {
                         error!("{}", self.format_exit_detail(&head));
                         return Err(head);
                     }
-                    let last = self.last_update_for(prompt_sid.as_deref());
+                    let last = *self.last_update_at.lock();
                     let now = Instant::now();
-                    if prompt_wait_should_timeout(last, wait_started, now, idle) {
+                    if let Some(kind) =
+                        prompt_wait_should_timeout(last, wait_started, now, idle, absolute)
+                    {
                         self.pending.lock().remove(&id);
                         let idle_secs = last
                             .unwrap_or(wait_started)
                             .elapsed()
                             .as_secs();
-                        let head = format!(
-                            "rpc timeout on {method} (id={id}) after {idle_secs}s idle (wall {}s)",
-                            wait_started.elapsed().as_secs()
-                        );
+                        let head = match kind {
+                            "absolute" => format!(
+                                "rpc timeout on {method} (id={id}) after {}s absolute (idle {idle_secs}s)",
+                                wait_started.elapsed().as_secs()
+                            ),
+                            _ => format!(
+                                "rpc timeout on {method} (id={id}) after {idle_secs}s idle (wall {}s)",
+                                wait_started.elapsed().as_secs()
+                            ),
+                        };
                         let logged = self.format_exit_detail(&head);
                         error!("{logged}");
                         return Err(head);
@@ -2455,19 +2561,13 @@ impl AcpClient {
             .await
             .map_err(|e| self.map_handshake_err("initialize", e))?;
 
-        let acp_agent_version = init
-            .pointer("/_meta/agentVersion")
-            .or_else(|| init.pointer("/agentVersion"))
-            .and_then(|v| v.as_str());
-        crate::cli_probe::record_acp_agent_version(acp_agent_version);
         info!(
-            "acp initialized agentVersion={:?} loadSession={:?} rewind={:?}",
-            acp_agent_version,
+            "acp initialized agentVersion={:?} loadSession={:?}",
+            init.pointer("/_meta/agentVersion")
+                .or_else(|| init.pointer("/agentVersion")),
             init.pointer("/agentCapabilities/loadSession")
                 .or_else(|| init.pointer("/capabilities/loadSession")),
-            initialize_advertises_rewind(&init),
         );
-        *self.rewind_supported.lock() = initialize_advertises_rewind(&init);
 
         // Live per-model context windows (ClaudeCode `_meta.modelState`).
         // Soft-fail silently when absent — Grok CLI does not expose this yet.
@@ -2482,25 +2582,17 @@ impl AcpClient {
         // Official independent mode: if the first attempt fails (stale/empty
         // agent-home after a custom-route clear, #528), re-sync ~/.grok →
         // agent-home and retry once before soft-continuing.
-        //
-        // Custom relays must skip this: `cached_token` reads ~/.grok/auth.json
-        // (still present after official login for billing). Grok Build then
-        // sends OIDC to the relay and the user sees “works until I sign in”.
-        //
-        // Unsigned-in official route must also skip: there is no token to
-        // load, and the CLI authenticate RPC times out at 12s × 2.
-        let has_cached_token = has_cached_token_for_authenticate();
-        if should_authenticate_cached_token(self.custom_route, has_cached_token) {
-            match self
-                .request_timeout(
-                    "authenticate",
-                    json!({ "methodId": "cached_token" }),
-                    AUTH_TIMEOUT_SECS,
-                )
-                .await
-            {
-                Ok(_) => info!("acp authenticate cached_token ok"),
-                Err(e) => {
+        match self
+            .request_timeout(
+                "authenticate",
+                json!({ "methodId": "cached_token" }),
+                AUTH_TIMEOUT_SECS,
+            )
+            .await
+        {
+            Ok(_) => info!("acp authenticate cached_token ok"),
+            Err(e) => {
+                if !self.custom_route {
                     if let Err(sync_e) = crate::account::sync_cli_auth_to_agent_home() {
                         warn!("acp authenticate: re-sync auth before retry failed: {sync_e}");
                     }
@@ -2521,12 +2613,10 @@ impl AcpClient {
                             );
                         }
                     }
+                } else {
+                    warn!("acp authenticate soft-fail (continuing): {e}");
                 }
             }
-        } else if self.custom_route {
-            info!("acp authenticate skipped (custom route: api_key only)");
-        } else {
-            info!("acp authenticate skipped (unsigned-in: no cached_token)");
         }
         Ok(init)
     }
@@ -2552,84 +2642,39 @@ impl AcpClient {
             .await
     }
 
-    /// [`Self::open_session_for`] using the id this process was spawned with.
+    /// [`Self::open_session`] with a caller-supplied cwd — warm-process reuse
+    /// may carry a different project than the process was spawned for (the CLI
+    /// session cwd is per-session, not process-global).
     pub async fn open_session_at(
         &self,
         resume_session_id: Option<&str>,
         fork_session: bool,
         cwd: &str,
     ) -> Result<(String, bool), AgentError> {
-        self.open_session_for(resume_session_id, fork_session, cwd, None)
-            .await
-    }
-
-    /// [`Self::open_session`] with a caller-supplied cwd.
-    ///
-    /// The CLI session cwd is per-session. OS sandbox write roots are **not** —
-    /// they stay locked to spawn cwd for the process lifetime. Hosts must not
-    /// warm-reuse a non-`off` sandboxed process onto a different project cwd
-    /// (#986); cold-spawn with the target cwd instead.
-    ///
-    /// `bound_app_session_id` is the chat this open serves. It wins over the id
-    /// stored at spawn, which is empty for an ownerless prewarm.
-    pub async fn open_session_for(
-        &self,
-        resume_session_id: Option<&str>,
-        fork_session: bool,
-        cwd: &str,
-        bound_app_session_id: Option<&str>,
-    ) -> Result<(String, bool), AgentError> {
-        let host_cwd = cwd.to_string();
-        if !crate::ssh_remote::acp_session_cwd_ok(self.ssh_alias.as_deref(), &host_cwd) {
+        let cwd = cwd.to_string();
+        if !std::path::Path::new(&cwd).is_dir() {
             return Err(AgentError::new(
                 AgentErrorCode::AgentCrashed,
-                format!("project cwd is not a directory: {host_cwd}"),
+                format!("project cwd is not a directory: {cwd}"),
             ));
         }
-
-        // WSL: CLI runs in Linux — map Windows drive / \\wsl$ paths for ACP
-        // session/new|load|fork. Host checks + MCP scan keep the Windows path.
-        // --cd at spawn already mapped via the same helper.
-        let cwd = if self.wsl_active {
-            crate::wsl_backend::windows_path_to_wsl(std::path::Path::new(&host_cwd)).map_err(
-                |e| {
-                    AgentError::new(
-                        AgentErrorCode::AgentCrashed,
-                        format!("WSL session cwd path map failed: {e}"),
-                    )
-                },
-            )?
-        } else {
-            host_cwd.clone()
-        };
 
         // Build ACP mcpServers off the async runtime. **Never block connect** on
         // MCP/OAuth: connect builder skips network refresh + CLI list, and a
         // hard budget falls back to `[]` so session/new|load always proceeds.
         // Official aux side-channel uses empty inject (no nested official-aux MCP).
-        // SSH: do not scan the remote path as a local project.
-        let mcp_servers = if self.empty_mcp_servers || self.ssh_alias.is_some() {
-            if self.ssh_alias.is_some() {
-                info!("acp session open empty mcpServers (ssh remote)");
-            } else {
-                info!("acp session open empty mcpServers (side-channel)");
-            }
+        let mcp_servers = if self.empty_mcp_servers {
+            info!("acp session open empty mcpServers (side-channel)");
             serde_json::json!([])
         } else {
-            let project_cwd = host_cwd.clone();
-            let app_session_id = crate::extensions::resolve_mcp_app_session_id(
-                bound_app_session_id,
-                self.app_session_id.as_deref(),
-            )
-            .map(str::to_string);
+            let project_cwd = cwd.clone();
             let budget = crate::extensions::MCP_CONNECT_BUDGET;
             let servers = match tokio::time::timeout(
                 budget,
                 tauri::async_runtime::spawn_blocking(move || {
-                    crate::extensions::build_session_mcp_servers_for_connect(
-                        Some(project_cwd.as_str()),
-                        app_session_id.as_deref(),
-                    )
+                    crate::extensions::build_session_mcp_servers_for_connect(Some(
+                        project_cwd.as_str(),
+                    ))
                 }),
             )
             .await
@@ -2660,14 +2705,11 @@ impl AcpClient {
                 if let Some((sid, model_id)) = self.try_fork_session(rid, &cwd, &mcp_servers).await
                 {
                     *self.agent_session_id.lock() = Some(sid.clone());
-                    let _ = self.event_tx.send((
-                        None,
-                        AcpEvent::State {
-                            backend: "grok_agent_stdio".into(),
-                            agent_session_id: Some(sid.clone()),
-                            model_id,
-                        },
-                    ));
+                    let _ = self.event_tx.send((None, AcpEvent::State {
+                        backend: "grok_agent_stdio".into(),
+                        agent_session_id: Some(sid.clone()),
+                        model_id,
+                    }));
                     // Full parent context was forked — treat like a successful resume
                     // for bootstrap purposes (no journal rewrite needed).
                     return Ok((sid, true));
@@ -2687,17 +2729,9 @@ impl AcpClient {
                         json!({
                             "sessionId": rid,
                             "cwd": cwd,
-                            "mcpServers": mcp_servers.clone(),
-                            // grok-build honours `_meta.noReplay` on session/load
-                            // (mvp_agent/session_setup.rs AttachPolicy): the agent keeps
-                            // full native context but skips streaming the transcript back.
-                            // The App already renders history from its own journal and
-                            // reconciles from chat_history after the turn, so the replay
-                            // only cost time (37s+ / 45s timeouts on ~200k-token chats).
-                            // Older CLIs ignore unknown `_meta`. Opt out: GROK_APP_FULL_REPLAY=1.
-                            "_meta": { "noReplay": session_load_no_replay() }
+                            "mcpServers": mcp_servers.clone()
                         }),
-                        SESSION_LOAD_TIMEOUT_SECS,
+                        HANDSHAKE_TIMEOUT_SECS,
                     )
                     .await
                 {
@@ -2713,14 +2747,11 @@ impl AcpClient {
                             .pointer("/models/currentModelId")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string());
-                        let _ = self.event_tx.send((
-                            None,
-                            AcpEvent::State {
-                                backend: "grok_agent_stdio".into(),
-                                agent_session_id: Some(sid.clone()),
-                                model_id,
-                            },
-                        ));
+                        let _ = self.event_tx.send((None, AcpEvent::State {
+                            backend: "grok_agent_stdio".into(),
+                            agent_session_id: Some(sid.clone()),
+                            model_id,
+                        }));
                         return Ok((sid, true));
                     }
                     Err(e) => {
@@ -2764,14 +2795,11 @@ impl AcpClient {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        let _ = self.event_tx.send((
-            None,
-            AcpEvent::State {
-                backend: "grok_agent_stdio".into(),
-                agent_session_id: Some(sid.clone()),
-                model_id,
-            },
-        ));
+        let _ = self.event_tx.send((None, AcpEvent::State {
+            backend: "grok_agent_stdio".into(),
+            agent_session_id: Some(sid.clone()),
+            model_id,
+        }));
 
         Ok((sid, false))
     }
@@ -2847,7 +2875,6 @@ impl AcpClient {
     }
 
     /// Back-compat: always create a new session.
-    #[allow(dead_code)]
     pub async fn initialize_and_new_session(&self) -> Result<String, AgentError> {
         self.initialize_and_open_session(None, false)
             .await
@@ -2876,18 +2903,16 @@ impl AcpClient {
         .await
     }
 
-    /// `x.ai/session/info` — the payload behind the pager `/context` view.
-    /// Live stdio registers the underscore form; older agents use the bare name.
-    pub async fn session_info(&self, session_id: &str) -> Result<Value, String> {
-        let params = json!({ "sessionId": session_id });
-        let raw = match self.request("_x.ai/session/info", params.clone()).await {
-            Ok(v) => v,
-            Err(e) if rpc_looks_like_method_not_found(&e) => {
-                self.request("x.ai/session/info", params).await?
-            }
-            Err(e) => return Err(e),
-        };
-        unwrap_session_info(raw)
+    /// Switch model on the live agent session (`session/set_model`).
+    /// Switch model on the live agent session (`session/set_model`).
+    /// Uses the process's most recently bound agent session id.
+    pub async fn set_model(&self, model_id: &str) -> Result<(), String> {
+        let sid = self
+            .agent_session_id
+            .lock()
+            .clone()
+            .ok_or_else(|| "no agent session".to_string())?;
+        self.set_model_for(&sid, model_id).await
     }
 
     /// Switch model on an explicit session (`session/set_model`).
@@ -2895,50 +2920,20 @@ impl AcpClient {
     /// mean — the process-level "recently bound" id may belong to another
     /// App session on the same process.
     pub async fn set_model_for(&self, session_id: &str, model_id: &str) -> Result<(), String> {
-        self.set_model_for_inner(session_id, model_id, None).await
-    }
-
-    /// Same as [`Self::set_model_for`], plus `_meta.contextWindow`.
-    /// Reasoning effort is omitted so the CLI keeps the current effort.
-    pub async fn set_context_window_for(
-        &self,
-        session_id: &str,
-        model_id: &str,
-        context_window: u64,
-    ) -> Result<(), String> {
-        if context_window == 0 {
-            return Err("context window must be positive".into());
-        }
-        self.set_model_for_inner(session_id, model_id, Some(context_window))
-            .await
-    }
-
-    async fn set_model_for_inner(
-        &self,
-        session_id: &str,
-        model_id: &str,
-        context_window: Option<u64>,
-    ) -> Result<(), String> {
         let model_id = model_id.trim();
         if model_id.is_empty() {
             return Err("model id empty".into());
         }
         let sid = session_id.to_string();
         // ACP SetSessionModelRequest: sessionId + modelId (+ optional meta).
-        // Absent `_meta` preserves effort and the selected window.
-        let params = match context_window {
-            Some(window) => json!({
-                "sessionId": sid,
-                "modelId": model_id,
-                "_meta": { "contextWindow": window },
-            }),
-            None => json!({
-                "sessionId": sid,
-                "modelId": model_id,
-            }),
-        };
         let result = self
-            .request("session/set_model", params)
+            .request(
+                "session/set_model",
+                json!({
+                    "sessionId": sid,
+                    "modelId": model_id,
+                }),
+            )
             .await
             .map_err(|e| format!("session/set_model: {e}"))?;
         // Best-effort: some agents echo currentModelId.
@@ -2947,23 +2942,17 @@ impl AcpClient {
             .or_else(|| result.get("modelId"))
             .and_then(|v| v.as_str())
         {
-            let _ = self.event_tx.send((
-                None,
-                AcpEvent::State {
-                    backend: "grok_agent_stdio".into(),
-                    agent_session_id: Some(sid),
-                    model_id: Some(mid.to_string()),
-                },
-            ));
+            let _ = self.event_tx.send((None, AcpEvent::State {
+                backend: "grok_agent_stdio".into(),
+                agent_session_id: Some(sid),
+                model_id: Some(mid.to_string()),
+            }));
         } else {
-            let _ = self.event_tx.send((
-                None,
-                AcpEvent::State {
-                    backend: "grok_agent_stdio".into(),
-                    agent_session_id: Some(sid),
-                    model_id: Some(model_id.to_string()),
-                },
-            ));
+            let _ = self.event_tx.send((None, AcpEvent::State {
+                backend: "grok_agent_stdio".into(),
+                agent_session_id: Some(sid),
+                model_id: Some(model_id.to_string()),
+            }));
         }
         Ok(())
     }
@@ -2980,11 +2969,7 @@ impl AcpClient {
     }
 
     /// Switch product session mode on an explicit session (`session/set_mode`).
-    pub async fn set_mode_for(
-        &self,
-        session_id: &str,
-        product_mode: &str,
-    ) -> Result<String, String> {
+    pub async fn set_mode_for(&self, session_id: &str, product_mode: &str) -> Result<String, String> {
         let sid = session_id.to_string();
         let candidates = crate::agent_prefs::product_mode_candidates(product_mode);
         let mut last_err = String::from("no mode candidates");
@@ -3006,12 +2991,6 @@ impl AcpClient {
                 Err(e) => {
                     last_err = e;
                     tracing::debug!("acp session/set_mode {mode_id} soft-fail: {last_err}");
-                    // Unknown modeId fails fast. A timeout / dead transport is
-                    // not "try the next alias" — agent mode has 5 candidates ×
-                    // 45s and left fork + parent chats stuck on 连接中.
-                    if set_mode_abort_remaining_candidates(&last_err) {
-                        break;
-                    }
                 }
             }
         }
@@ -3076,25 +3055,19 @@ impl AcpClient {
             .unwrap_or("end_turn")
             .to_string();
 
-        let _ = self.event_tx.send((
-            Some(sid.clone()),
-            AcpEvent::Stream {
-                kind: StreamKind::Assistant,
-                text: String::new(),
-                message_id: None,
-                done: true,
-            },
-        ));
+        let _ = self.event_tx.send((Some(sid.clone()), AcpEvent::Stream {
+            kind: StreamKind::Assistant,
+            text: String::new(),
+            message_id: None,
+            done: true,
+        }));
         // Belt-and-suspenders with handle_line's unconditional PromptComplete
         // for session/prompt Ok (#522). Duplicate authoritative completes are
         // safe: second pass finds prompt_in_flight already false.
-        let _ = self.event_tx.send((
-            Some(sid),
-            AcpEvent::PromptComplete {
-                stop_reason: stop,
-                authoritative: true,
-            },
-        ));
+        let _ = self.event_tx.send((Some(sid), AcpEvent::PromptComplete {
+            stop_reason: stop,
+            authoritative: true,
+        }));
         Ok(())
     }
 
@@ -3105,7 +3078,6 @@ impl AcpClient {
     /// - Older / reverse-RPC style: `_x.ai/interject`
     ///
     /// Interject into the most recently bound agent session.
-    #[allow(dead_code)]
     pub async fn interject(&self, text: &str) -> Result<(), String> {
         let sid = self
             .agent_session_id
@@ -3169,24 +3141,15 @@ impl AcpClient {
     /// old session thread to finish, and an evicted (shutdown) thread finishes
     /// immediately instead of hanging for the whole deadline.
     pub async fn evict_sessions(&self, session_ids: &[String]) -> Result<Value, String> {
-        let result = self
-            .request_timeout(
-                "x.ai/internal/evict_sessions",
-                json!({ "sessionIds": session_ids }),
-                5,
-            )
-            .await;
-        if result.is_ok() {
-            let mut map = self.last_update_by_session.lock();
-            for sid in session_ids {
-                map.remove(sid);
-            }
-        }
-        result
+        self.request_timeout(
+            "x.ai/internal/evict_sessions",
+            json!({ "sessionIds": session_ids }),
+            5,
+        )
+        .await
     }
 
     /// List rewind points (one per user prompt). Grok extension `x.ai/rewind/points`.
-    #[allow(dead_code)]
     pub async fn rewind_points(&self) -> Result<Value, String> {
         let sid = self
             .agent_session_id
@@ -3197,10 +3160,12 @@ impl AcpClient {
     }
 
     /// List rewind points on an explicit session (shared-process safe).
-    #[allow(dead_code)]
     pub async fn rewind_points_for(&self, session_id: &str) -> Result<Value, String> {
-        self.request("x.ai/rewind/points", json!({ "sessionId": session_id }))
-            .await
+        self.request(
+            "x.ai/rewind/points",
+            json!({ "sessionId": session_id }),
+        )
+        .await
     }
 
     /// Truncate agent conversation to a user-prompt index (and optionally restore files).
@@ -3210,7 +3175,6 @@ impl AcpClient {
     /// For "edit last user message", pass the **previous** user-turn index, or when
     /// editing the only user message use index `0` with a full clear via host journal.
     /// Truncate agent conversation on the most recently bound session.
-    #[allow(dead_code)]
     pub async fn rewind_execute(
         &self,
         target_prompt_index: u32,
@@ -3226,22 +3190,12 @@ impl AcpClient {
     }
 
     /// Truncate agent conversation on an explicit session (shared-process safe).
-    ///
-    /// Tries `x.ai/rewind/execute` then `_x.ai/rewind/execute` (stdio often
-    /// registers the underscored ext-method, same as interject). Skips the RPC
-    /// when `initialize` explicitly did not advertise rewind.
     pub async fn rewind_execute_for(
         &self,
         session_id: &str,
         target_prompt_index: u32,
         restore_files: bool,
     ) -> Result<Value, String> {
-        if self.rewind_supported.lock().as_ref() == Some(&false) {
-            // Phrase matches `rpc_looks_like_method_not_found` so callers
-            // (journal drop-last) take the clean unsupported path, not the
-            // last-turn fallback retry.
-            return Err("rewind method not supported (not advertised by agent initialize)".into());
-        }
         // Prefer conversation truncate; file restore is optional (edit-resend usually false).
         let mut params = json!({
             "sessionId": session_id,
@@ -3252,21 +3206,7 @@ impl AcpClient {
             // Some builds accept this camelCase alias.
             obj.insert("restore_files".into(), Value::Bool(restore_files));
         }
-        let mut last_err = String::new();
-        for method in rewind_execute_method_candidates() {
-            match self.request(method, params.clone()).await {
-                Ok(v) => {
-                    *self.rewind_supported.lock() = Some(true);
-                    return Ok(v);
-                }
-                Err(e) if rpc_looks_like_method_not_found(&e) => {
-                    last_err = e;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        *self.rewind_supported.lock() = Some(false);
-        Err(last_err)
+        self.request("x.ai/rewind/execute", params).await
     }
 
     /// Unblock a waiting `session/prompt` RPC (e.g. after host circuit-breaker cancel).
@@ -3338,77 +3278,15 @@ impl AcpClient {
         self.write_line(&msg).await
     }
 
-    #[allow(dead_code)]
     pub fn agent_session_id(&self) -> Option<String> {
         self.agent_session_id.lock().clone()
     }
 
-    /// OS PID of the spawned child, if any (None for TCP / API mode).
-    pub fn child_pid(&self) -> Option<u32> {
-        self.child_pid
-    }
-
-    /// Whether stop should tree-kill local Windows descendants.
-    pub fn owns_local_process_tree(&self) -> bool {
-        self.owns_local_process_tree
-    }
-
     pub async fn kill(&self) {
-        // Stop both halves of the transport before touching the child. This is
-        // essential for TCP ACP: closing only the writer left the reader task
-        // alive and allowed ghost events from a remote peer after recycle.
-        self.stopped.store(true, Ordering::SeqCst);
-        self.reader_alive.store(false, Ordering::SeqCst);
-        // `notify_waiters` only wakes tasks that are already waiting.  The
-        // reader checks `reader_alive` immediately before entering `select!`,
-        // so a kill racing that boundary could otherwise leave a TCP read
-        // blocked forever.  `notify_one` stores a permit when no waiter exists,
-        // making the cancellation edge-triggered and race-safe for the single
-        // reader task.
-        self.reader_stop.notify_one();
-        self.fail_all_pending("agent stopped");
-
-        // Take the child handle first so kill_on_drop cannot race tree-kill.
-        let child_opt = self.child.lock().await.take();
-        let pid = self
-            .child_pid
-            .or_else(|| child_opt.as_ref().and_then(|c| c.id()));
-
-        // Windows local native only: taskkill /T so tool/shell grandchildren die.
-        // SSH/WSL/TCP must not get local process-tree kill.
-        // Off the async worker — sync taskkill wait must not stall Tokio.
-        #[cfg(windows)]
-        if self.owns_local_process_tree {
-            if let Some(pid) = pid {
-                let ok = crate::process_util::kill_process_tree_async(pid).await;
-                info!(pid, ok, "acp: windows process-tree kill");
-            }
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.kill().await;
         }
-
-        if let Some(mut child) = child_opt {
-            match child.kill().await {
-                Ok(()) => {
-                    if let Some(pid) = pid {
-                        info!(pid, "acp: child.kill ok");
-                    }
-                }
-                Err(e) => {
-                    warn!(pid = ?pid, error = %e, "acp: child.kill failed");
-                }
-            }
-        }
-
         *self.stdin.lock().await = None;
-        self.last_update_by_session.lock().clear();
-        *self.last_update_unstamped.lock() = None;
-        let proc_home = self
-            .proc_home
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(dir) = proc_home {
-            crate::agent_proc_home::discard(&dir);
-        }
     }
 }
 
@@ -3494,57 +3372,6 @@ pub fn wire_session_interject_params(session_id: &str, text: &str) -> Value {
     })
 }
 
-/// Pull the session-info object out of an ext-method result.
-///
-/// Grok Build wraps it as `{ "result": SessionInfoResponse, "error"?: ... }`.
-/// Some agents return the object itself, or either form as a JSON string.
-pub(crate) fn unwrap_session_info(raw: Value) -> Result<Value, String> {
-    let value = coerce_session_info_json(raw);
-    if let Some(err) = value.get("error").filter(|e| !e.is_null()) {
-        let has_body = value.get("result").is_some_and(|r| r.is_object());
-        if !has_body {
-            return Err(session_info_error_text(err));
-        }
-    }
-    let body = value
-        .get("result")
-        .filter(|r| r.is_object())
-        .cloned()
-        .unwrap_or(value);
-    if body.get("context").is_some()
-        || body.get("sessionId").is_some()
-        || body.get("session_id").is_some()
-    {
-        return Ok(body);
-    }
-    Err("invalid session info response".into())
-}
-
-fn coerce_session_info_json(raw: Value) -> Value {
-    match raw {
-        Value::String(s) => serde_json::from_str(&s).unwrap_or(Value::Null),
-        Value::Object(map) => {
-            if let Some(Value::String(s)) = map.get("result") {
-                if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                    return parsed;
-                }
-            }
-            Value::Object(map)
-        }
-        other => other,
-    }
-}
-
-fn session_info_error_text(err: &Value) -> String {
-    if let Some(s) = err.as_str() {
-        return s.to_string();
-    }
-    err.get("message")
-        .and_then(|m| m.as_str())
-        .map(str::to_string)
-        .unwrap_or_else(|| err.to_string())
-}
-
 /// Whether an ACP RPC error indicates the method name is unknown on this agent.
 ///
 /// Used to fall back from `x.ai/interject` → `_x.ai/interject` (and similar dual tries).
@@ -3555,58 +3382,6 @@ pub fn rpc_looks_like_method_not_found(err: &str) -> bool {
         || lower.contains("unknown method")
         || lower.contains("unknown ext_method")
         || lower.contains("method not supported")
-}
-
-/// Wire method names for conversation rewind (canonical, then stdio underscore).
-pub fn rewind_execute_method_candidates() -> &'static [&'static str] {
-    &["x.ai/rewind/execute", "_x.ai/rewind/execute"]
-}
-
-/// Parse `initialize` for rewind support.
-///
-/// - `Some(true)` when a methods list includes rewind
-/// - `Some(false)` when an explicit methods list exists and omits rewind
-/// - `None` when initialize does not publish a methods list (try RPC)
-pub fn initialize_advertises_rewind(init: &Value) -> Option<bool> {
-    const LISTS: &[&str] = &[
-        "/_meta/extMethods",
-        "/_meta/rpcMethods",
-        "/_meta/methods",
-        "/agentCapabilities/extMethods",
-        "/agentCapabilities/_meta/extMethods",
-        "/capabilities/extMethods",
-    ];
-    let mut saw_list = false;
-    for pointer in LISTS {
-        let Some(arr) = init.pointer(pointer).and_then(|v| v.as_array()) else {
-            continue;
-        };
-        saw_list = true;
-        for item in arr {
-            let name = item.as_str().map(str::to_string).or_else(|| {
-                item.get("method")
-                    .or_else(|| item.get("name"))
-                    .or_else(|| item.get("id"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            });
-            if name.as_deref().is_some_and(method_looks_like_rewind) {
-                return Some(true);
-            }
-        }
-    }
-    if saw_list {
-        return Some(false);
-    }
-    None
-}
-
-fn method_looks_like_rewind(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower.contains("rewind/execute")
-        || lower.contains("x.ai/rewind")
-        || lower.contains("_x.ai/rewind")
-        || lower == "rewind"
 }
 
 /// Host → agent `session/cancel` notification params.
@@ -3698,7 +3473,11 @@ pub fn decode_permission_request(rpc_id: u64, params: &Value) -> AcpEvent {
         .or_else(|| {
             // Title is often the tool id for Grok Build tools.
             let t = title.trim();
-            if !t.is_empty() && t != "Tool permission" && !t.contains(' ') && t.contains('_') {
+            if !t.is_empty()
+                && t != "Tool permission"
+                && !t.contains(' ')
+                && t.contains('_')
+            {
                 Some(t.to_string())
             } else {
                 None
@@ -4036,14 +3815,6 @@ pub fn decode_session_update(params: &Value) -> Vec<AcpEvent> {
                 out.push(AcpEvent::ToolOpenReleased { tool_call_id });
             }
         }
-        // Subagent lifecycle. CLI 1.0.x reports these on the xAI
-        // extension notification channel with a *stable* subagent id, so the
-        // Tasks panel no longer has to infer parent links from stream order.
-        "subagent_spawned" | "subagent_progress" | "subagent_finished" => {
-            if let Some(ev) = parse_subagent_update(kind, update) {
-                out.push(ev);
-            }
-        }
         "retry_state" => {
             let attempt = update.get("attempt").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let max_retries = update
@@ -4085,7 +3856,8 @@ pub fn decode_session_update(params: &Value) -> Vec<AcpEvent> {
             // `auto_compact_started` / bare `tokens_used` are occupancy snapshots
             // (tokens_used + window), not compact completions — do not emit
             // ContextCompact without before/after (that would wipe the chip).
-            let is_occupancy_only = kind == "tokens_used" || kind == "auto_compact_started";
+            let is_occupancy_only =
+                kind == "tokens_used" || kind == "auto_compact_started";
             if !is_occupancy_only {
                 if let Some((trigger, before, after, summary, note)) =
                     parse_context_compact_update(kind, update)
@@ -4192,10 +3964,6 @@ pub fn decode_session_update(params: &Value) -> Vec<AcpEvent> {
                 cache_creation_tokens: None,
                 reasoning_tokens: None,
                 cost_usd_ticks: None,
-                model_calls: None,
-                api_duration_ms: None,
-                cost_is_partial: None,
-                usage_is_incomplete: None,
                 context_window: None,
                 percentage: None,
                 source: "context_size".to_string(),
@@ -4204,78 +3972,6 @@ pub fn decode_session_update(params: &Value) -> Vec<AcpEvent> {
     }
 
     out
-}
-
-/// Decode one `subagent_spawned` / `subagent_progress` / `subagent_finished`
-/// notification. Returns `None` when the update carries no subagent id — an
-/// id-less row cannot be tracked or de-duplicated, so it is not surfaced.
-pub fn parse_subagent_update(kind: &str, update: &Value) -> Option<AcpEvent> {
-    let subagent_id = update
-        .get("subagent_id")
-        .or_else(|| update.get("subagentId"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if subagent_id.is_empty() {
-        return None;
-    }
-    let phase = match kind {
-        "subagent_spawned" => SubagentPhase::Spawned,
-        "subagent_progress" => SubagentPhase::Progress,
-        "subagent_finished" => SubagentPhase::Finished,
-        _ => return None,
-    };
-    let str_field = |keys: &[&str]| -> Option<String> {
-        keys.iter()
-            .find_map(|k| update.get(*k))
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-    };
-    let num_field = |keys: &[&str]| -> Option<u64> {
-        keys.iter()
-            .find_map(|k| update.get(*k))
-            .and_then(|v| v.as_u64())
-    };
-    Some(AcpEvent::Subagent(SubagentUpdate {
-        phase,
-        subagent_id,
-        subagent_type: str_field(&["subagent_type", "subagentType"]),
-        description: str_field(&["description", "summary"]),
-        status: str_field(&["status"]),
-        duration_ms: num_field(&["duration_ms", "durationMs"]),
-        // `subagent_finished` reports the counters as `turns` / `tool_calls`;
-        // `subagent_progress` uses the longer names. Accept both so a run whose
-        // progress frames were throttled away still shows its totals.
-        turn_count: num_field(&["turn_count", "turnCount", "turns"]),
-        tool_call_count: num_field(&["tool_call_count", "toolCallCount", "tool_calls"]),
-        tokens_used: num_field(&["tokens_used", "tokensUsed"]),
-        context_window_tokens: num_field(&["context_window_tokens", "contextWindowTokens"]),
-        output: str_field(&["output", "result"]),
-    }))
-}
-
-impl SubagentUpdate {
-    /// `session://subagent` payload (snake_case keys are flattened to camelCase
-    /// for the frontend). Absent values stay `null` — the UI must not invent them.
-    pub fn to_payload(&self, app_session_id: &str) -> Value {
-        json!({
-            "sessionId": app_session_id,
-            "phase": self.phase.as_str(),
-            "subagentId": self.subagent_id,
-            "subagentType": self.subagent_type,
-            "description": self.description,
-            "status": self.status,
-            "durationMs": self.duration_ms,
-            "turnCount": self.turn_count,
-            "toolCallCount": self.tool_call_count,
-            "tokensUsed": self.tokens_used,
-            "contextWindowTokens": self.context_window_tokens,
-            "output": self.output,
-        })
-    }
 }
 
 /// One choice inside an ask-user question.
@@ -4550,60 +4246,6 @@ mod session_update_decode_tests {
     }
 
     #[test]
-    fn native_web_search_tool_lifecycle_keeps_wire_identity_and_payload() {
-        let pending = decode_session_update(&json!({
-            "sessionId": "s-native-search",
-            "update": {
-                "sessionUpdate": "tool_call",
-                "toolCallId": "call-web-1",
-                "status": "pending",
-                "kind": "search",
-                "title": "web_search",
-                "rawInput": { "query": "Grok Build ACP" }
-            }
-        }));
-        let completed = decode_session_update(&json!({
-            "sessionId": "s-native-search",
-            "update": {
-                "sessionUpdate": "tool_call_update",
-                "toolCallId": "call-web-1",
-                "status": "completed",
-                "kind": "search",
-                "title": "web_search",
-                "content": [{ "type": "text", "text": "search result" }]
-            }
-        }));
-
-        assert!(matches!(
-            &pending[..],
-            [AcpEvent::ToolCall {
-                tool_call_id,
-                title,
-                kind,
-                status,
-                raw,
-            }] if tool_call_id == "call-web-1"
-                && title == "web_search"
-                && kind == "search"
-                && status == "pending"
-                && raw.pointer("/rawInput/query").and_then(Value::as_str)
-                    == Some("Grok Build ACP")
-        ));
-        assert!(matches!(
-            &completed[..],
-            [AcpEvent::ToolCall {
-                tool_call_id,
-                status,
-                raw,
-                ..
-            }] if tool_call_id == "call-web-1"
-                && status == "completed"
-                && raw.pointer("/content/0/text").and_then(Value::as_str)
-                    == Some("search result")
-        ));
-    }
-
-    #[test]
     fn hook_execution_decodes_with_runs() {
         let evs = decode_session_update(&json!({
             "update": {
@@ -4838,46 +4480,8 @@ mod context_tokens_tests {
         let windows = parse_model_context_tokens(&init);
         assert_eq!(windows.len(), 1);
         assert_eq!(windows.get("has-window"), Some(&128000));
-        assert!(!windows.contains_key("no-window"));
-        assert!(!windows.contains_key("no-meta"));
-    }
-
-    #[test]
-    fn parse_usage_extracts_session_spend_fields() {
-        let update = json!({
-            "usage": {
-                "inputTokens": 127521,
-                "outputTokens": 2554,
-                "totalTokens": 130075,
-                "cachedReadTokens": 69504,
-                "reasoningTokens": 1698,
-                "modelCalls": 3,
-                "apiDurationMs": 56883,
-                "costUsdTicks": 2011100000u64,
-                "costIsPartial": false,
-                "usageIsIncomplete": true
-            }
-        });
-        let ev = parse_usage_update("turn_completed", &update).expect("usage");
-        match ev {
-            AcpEvent::UsageReported {
-                model_calls,
-                api_duration_ms,
-                cost_usd_ticks,
-                cost_is_partial,
-                usage_is_incomplete,
-                source,
-                ..
-            } => {
-                assert_eq!(model_calls, Some(3));
-                assert_eq!(api_duration_ms, Some(56883));
-                assert_eq!(cost_usd_ticks, Some(2011100000));
-                assert_eq!(cost_is_partial, Some(false));
-                assert_eq!(usage_is_incomplete, Some(true));
-                assert_eq!(source, "turn_completed");
-            }
-            _ => panic!("expected UsageReported"),
-        }
+        assert!(windows.get("no-window").is_none());
+        assert!(windows.get("no-meta").is_none());
     }
 
     #[test]
@@ -4972,7 +4576,9 @@ mod context_tokens_tests {
                 source,
                 input_tokens,
                 ..
-            } if source == "context_size" => Some((*total_tokens, *input_tokens)),
+            } if source == "context_size" => {
+                Some((*total_tokens, *input_tokens))
+            }
             _ => None,
         });
         assert_eq!(size, Some((Some(27148), None)));
@@ -5038,11 +4644,12 @@ mod context_tokens_tests {
             }
             _ => None,
         });
-        assert_eq!(occ, Some((Some(402603), Some(500000), Some(81), None)));
+        assert_eq!(
+            occ,
+            Some((Some(402603), Some(500000), Some(81), None))
+        );
         // Must not emit ContextCompact (no tokens_after yet).
-        assert!(evs
-            .iter()
-            .all(|e| !matches!(e, AcpEvent::ContextCompact { .. })));
+        assert!(evs.iter().all(|e| !matches!(e, AcpEvent::ContextCompact { .. })));
     }
 
     #[test]
@@ -5065,10 +4672,7 @@ mod context_tokens_tests {
             } => Some((*tokens_before, *tokens_after, trigger.clone())),
             _ => None,
         });
-        assert_eq!(
-            compact,
-            Some((Some(402603), Some(34179), "auto".to_string()))
-        );
+        assert_eq!(compact, Some((Some(402603), Some(34179), "auto".to_string())));
     }
 
     /// Regression: session 08dddbec — tool_call_update title carried a python
@@ -5095,8 +4699,7 @@ PY";
             }
         }));
         assert!(
-            evs.iter()
-                .all(|e| !matches!(e, AcpEvent::ContextCompact { .. })),
+            evs.iter().all(|e| !matches!(e, AcpEvent::ContextCompact { .. })),
             "tool title containing the word compact must not be ContextCompact: {evs:?}"
         );
         assert!(
@@ -5118,8 +4721,7 @@ PY";
             }
         }));
         assert!(
-            evs.iter()
-                .all(|e| !matches!(e, AcpEvent::ContextCompact { .. })),
+            evs.iter().all(|e| !matches!(e, AcpEvent::ContextCompact { .. })),
             "unknown update title must not invent compact: {evs:?}"
         );
     }
@@ -5259,11 +4861,6 @@ fn classify_rpc_error(e: &str) -> AgentError {
     if crate::error::looks_like_linux_sandbox_block(e) {
         return AgentError::new(AgentErrorCode::SandboxBlocked, e);
     }
-    // Terminal included-usage / credit exhaustion first — keep the CLI sentence,
-    // not a generic 429 / "provider retries exhausted" wrapper.
-    if is_terminal_quota_reason(e) {
-        return AgentError::new(AgentErrorCode::QuotaExceeded, humanize_quota_reason(e));
-    }
     let lower = e.to_lowercase();
     if lower.contains("quota")
         || lower.contains("rate limit")
@@ -5358,7 +4955,10 @@ mod classify_rpc_error_tests {
     #[test]
     fn invalid_or_expired_credentials_is_auth() {
         let msg = "cli-proxy HTTP 401: Invalid or expired credentials (auth_kind=bearer, x_xai_token_auth=none, upstream=PermissionDenied, reason=no auth context)";
-        assert_eq!(classify_rpc_error(msg).code, AgentErrorCode::AuthFailed);
+        assert_eq!(
+            classify_rpc_error(msg).code,
+            AgentErrorCode::AuthFailed
+        );
         assert_eq!(
             classify_rpc_error("WKE=unauthenticated:bad-credentials").code,
             AgentErrorCode::AuthFailed
@@ -5403,159 +5003,11 @@ mod classify_rpc_error_tests {
             AgentErrorCode::NetworkProvider
         );
     }
-
-    #[test]
-    fn free_usage_exhausted_429_is_quota_not_network() {
-        let msg = "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window — tokens (actual/limit): 561857/500000. Upgrade to a Grok subscription for higher limits: https://grok.com/supergrok";
-        let err = classify_rpc_error(msg);
-        assert_eq!(err.code, AgentErrorCode::QuotaExceeded, "msg={msg}");
-        assert!(
-            err.message
-                .contains("You've used all the included free usage"),
-            "message={}",
-            err.message
-        );
-        assert!(
-            !err.message.contains("Provider request failed"),
-            "message={}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn host_quota_abort_rpc_message_classifies_as_quota() {
-        let reason = "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now.";
-        let abort = provider_retry_abort_rpc_message(reason);
-        assert_eq!(
-            classify_rpc_error(&abort).code,
-            AgentErrorCode::QuotaExceeded,
-            "abort={abort}"
-        );
-    }
 }
 
 /// Hard transport failures (no HTTP response) — fail after a few attempts so
 /// a broken proxy / DNS outage cannot pin the UI as "thinking" for minutes.
 const HARD_TRANSPORT_ABORT_ATTEMPTS: u32 = 3;
-
-/// Terminal official/credit exhaustion — not a flaky 429 the host should ride out.
-///
-/// Real CLI/provider text looks like:
-/// `API error (status 429 …): subscription:free-usage-exhausted: You've used all the included free usage…`
-pub fn is_terminal_quota_reason(reason: &str) -> bool {
-    let r = reason.to_ascii_lowercase();
-    if r.is_empty() {
-        return false;
-    }
-    r.contains("free-usage-exhausted")
-        || r.contains("free_usage_exhausted")
-        || r.contains("usage-exhausted")
-        || r.contains("usage_exhausted")
-        || r.contains("included free usage")
-        || r.contains("included usage exhausted")
-        || r.contains("you've used all")
-        || r.contains("you have used all")
-        || r.contains("used all the included")
-        || r.contains("out of credits")
-        || r.contains("insufficient credit")
-        || r.contains("quota exceeded")
-        || r.contains("quota_exceeded")
-        || r.contains("额度用尽")
-        || r.contains("额度已用尽")
-        || r.contains("额度已用完")
-        || r.contains("免費額度")
-        || r.contains("免费额度已")
-}
-
-/// Prefer the CLI/provider sentence; drop HTTP / retry wrappers and billing CTA.
-pub fn humanize_quota_reason(reason: &str) -> String {
-    let trimmed = reason.trim();
-    if trimmed.is_empty() {
-        return "Included usage is exhausted".to_string();
-    }
-    let lower = trimmed.to_ascii_lowercase();
-    for needle in [
-        "free-usage-exhausted:",
-        "free_usage_exhausted:",
-        "usage-exhausted:",
-        "usage_exhausted:",
-        "quota_exceeded:",
-        "quota exceeded:",
-    ] {
-        if let Some(idx) = lower.find(needle) {
-            let rest = trimmed[idx + needle.len()..].trim();
-            if !rest.is_empty() {
-                return truncate_quota_sentence(rest);
-            }
-        }
-    }
-    for needle in [
-        "you've used all",
-        "you have used all",
-        "used all the included",
-    ] {
-        if let Some(idx) = lower.find(needle) {
-            return truncate_quota_sentence(trimmed[idx..].trim());
-        }
-    }
-    truncate_quota_sentence(trimmed)
-}
-
-fn truncate_quota_sentence(s: &str) -> String {
-    let mut out = s;
-    if let Some(idx) = out.find("tokens (actual") {
-        out = out[..idx].trim_end_matches([' ', '—', '–', '-']);
-    }
-    let out = out.trim();
-    if out.chars().count() > 280 {
-        let end = out
-            .char_indices()
-            .nth(280)
-            .map(|(i, _)| i)
-            .unwrap_or(out.len());
-        format!("{}…", &out[..end])
-    } else {
-        out.to_string()
-    }
-}
-
-/// Chat-visible error when host stops waiting on `retry_state`.
-pub fn provider_retry_abort_error(attempt: u32, cap: u32, reason: &str) -> AgentError {
-    if is_terminal_quota_reason(reason) {
-        AgentError::new(AgentErrorCode::QuotaExceeded, humanize_quota_reason(reason))
-    } else {
-        let msg = if reason.trim().is_empty() {
-            format!("Provider request failed after {attempt} attempts (budget {cap})")
-        } else {
-            format!("Provider request failed after {attempt} attempts (budget {cap}): {reason}")
-        };
-        AgentError::new(AgentErrorCode::NetworkProvider, msg)
-    }
-}
-
-/// Unblock `session/prompt` after a host circuit-break. Must classify as quota
-/// when the reason is terminal, so a late RPC error cannot overwrite the deck.
-pub fn provider_retry_abort_rpc_message(reason: &str) -> String {
-    if is_terminal_quota_reason(reason) {
-        format!(
-            "included usage exhausted: {}",
-            humanize_quota_reason(reason)
-        )
-    } else {
-        format!("provider retries exhausted (host cap {HOST_PROVIDER_MAX_RETRIES})")
-    }
-}
-
-/// Mid-stream body decode failure reported by the CLI reqwest client.
-///
-/// This is a flaky SSE break, not a dead socket. The same reason often
-/// recovers and keeps editing, so it must **not** join
-/// [`is_hard_transport_retry_reason`] or fail the turn on attempt 1.
-pub fn is_stream_decode_retry_reason(reason: &str) -> bool {
-    reason
-        .to_ascii_lowercase()
-        .contains("error decoding response body")
-}
 
 /// True when the retry reason looks like a hard transport failure (not a flaky 5xx).
 pub fn is_hard_transport_retry_reason(reason: &str) -> bool {
@@ -5578,20 +5030,17 @@ pub fn is_hard_transport_retry_reason(reason: &str) -> bool {
 /// Whether host should stop waiting and fail the turn.
 ///
 /// - Terminal statuses (`exhausted` / `gave_up`) always abort.
-/// - Terminal quota reasons (see [`is_terminal_quota_reason`]) abort immediately
-///   so included-usage exhaustion is not ridden out as a flaky 429.
 /// - Hard transport reasons (see [`is_hard_transport_retry_reason`]) abort after
 ///   a few attempts so the chat does not stay busy for the full 15-retry budget.
 /// - Bare `failed` / `error` only abort once we have used most of the budget —
 ///   some relays emit `failed` on a single stream blip while still retrying.
 /// - Otherwise abort when `attempt` reaches the host/agent cap.
-#[allow(dead_code)]
 pub fn should_abort_provider_retry(attempt: u32, max_retries: u32, status: &str) -> bool {
     should_abort_provider_retry_ex(attempt, max_retries, status, "")
 }
 
 /// Like [`should_abort_provider_retry`] but consults the human-readable reason
-/// for hard-transport fail-fast and terminal quota.
+/// for hard-transport fail-fast.
 pub fn should_abort_provider_retry_ex(
     attempt: u32,
     max_retries: u32,
@@ -5604,9 +5053,6 @@ pub fn should_abort_provider_retry_ex(
         || status.contains("give_up")
         || status.contains("abort")
     {
-        return true;
-    }
-    if is_terminal_quota_reason(reason) {
         return true;
     }
     if is_hard_transport_retry_reason(reason) && attempt >= HARD_TRANSPORT_ABORT_ATTEMPTS {
@@ -5836,11 +5282,9 @@ pub async fn probe_acp_server(addr: &str) -> AcpProbeResult {
                 return AcpProbeResult::fail("connected, but no ACP initialize result in response");
             }
             let meta = &result["_meta"];
-            let agent_version = meta["agentVersion"].as_str().map(String::from);
-            crate::cli_probe::record_acp_agent_version(agent_version.as_deref());
             AcpProbeResult {
                 ok: true,
-                agent_version,
+                agent_version: meta["agentVersion"].as_str().map(String::from),
                 model: meta["modelState"]["currentModelId"]
                     .as_str()
                     .map(String::from),
@@ -5950,50 +5394,7 @@ mod retry_tests {
             "HTTP 503 Service Unavailable"
         ));
         assert!(is_hard_transport_retry_reason(reason));
-        assert!(!is_hard_transport_retry_reason(
-            "HTTP 503 Service Unavailable"
-        ));
-    }
-
-    #[test]
-    fn stream_decode_error_is_not_a_hard_abort() {
-        let reason = "reqwest error stream: Transport error: error decoding response body";
-        assert!(is_stream_decode_retry_reason(reason));
-        assert!(is_stream_decode_retry_reason(
-            "Transport error: Error decoding response body"
-        ));
-        assert!(!is_stream_decode_retry_reason(
-            "error sending request for url"
-        ));
-        assert!(!is_hard_transport_retry_reason(reason));
-        assert!(!should_abort_provider_retry_ex(1, 15, "retrying", reason));
-        assert!(!should_abort_provider_retry_ex(3, 15, "retrying", reason));
-    }
-
-    #[test]
-    fn terminal_quota_fails_fast_and_is_not_a_bare_429() {
-        let reason = "API error (status 429 Too Many Requests): subscription:free-usage-exhausted: You've used all the included free usage for model grok-4.6 for now. Usage resets over a rolling 24-hour window";
-        assert!(is_terminal_quota_reason(reason));
-        assert!(!is_terminal_quota_reason(
-            "API error (status 429 Too Many Requests): rate limit, retry later"
-        ));
-        assert!(!is_terminal_quota_reason("HTTP 503 Service Unavailable"));
-        assert!(should_abort_provider_retry_ex(1, 15, "retrying", reason));
-        assert!(!should_abort_provider_retry_ex(
-            1,
-            15,
-            "retrying",
-            "API error (status 429 Too Many Requests): rate limit, retry later"
-        ));
-        let err = provider_retry_abort_error(1, 15, reason);
-        assert_eq!(err.code, AgentErrorCode::QuotaExceeded);
-        assert!(err
-            .message
-            .contains("You've used all the included free usage"));
-        assert!(!err.message.contains("Provider request failed"));
-        let net = provider_retry_abort_error(15, 15, "HTTP 503 Service Unavailable");
-        assert_eq!(net.code, AgentErrorCode::NetworkProvider);
-        assert!(net.message.contains("Provider request failed after 15"));
+        assert!(!is_hard_transport_retry_reason("HTTP 503 Service Unavailable"));
     }
 }
 
@@ -6013,11 +5414,13 @@ mod prompt_fallback_tests {
     #[test]
     fn fallback_sid_match_is_scoped_per_session() {
         // Concurrent turns on one process: an explicit target only matches its
-        // own session's prompt. Cross-None matching is no longer allowed (P0-4).
+        // own session's prompt.
         assert!(pending_prompt_matches(Some("sidA"), Some("sidA")));
         assert!(!pending_prompt_matches(Some("sidA"), Some("sidB")));
-        assert!(!pending_prompt_matches(None, Some("sidA")));
-        assert!(!pending_prompt_matches(Some("sidA"), None));
+        // Legacy prompts without a recorded sid match any target (never stranded).
+        assert!(pending_prompt_matches(None, Some("sidA")));
+        // Unscoped fallback (no target) frees any pending prompt.
+        assert!(pending_prompt_matches(Some("sidA"), None));
         assert!(pending_prompt_matches(None, None));
     }
 
@@ -6042,41 +5445,6 @@ mod prompt_fallback_tests {
         let now = Instant::now();
         assert!(prompt_fallback_due(Some(now - grace()), grace(), now));
     }
-
-    #[test]
-    fn completed_turn_fallback_cannot_adopt_immediate_next_prompt() {
-        let mut pending = HashMap::new();
-        let (first_tx, _first_rx) = oneshot::channel();
-        pending.insert(
-            4,
-            Pending {
-                method: "session/prompt".into(),
-                tx: first_tx,
-                session_id: Some("sidA".into()),
-            },
-        );
-
-        // Turn A emits prompt_complete, so its fallback captures only id=4.
-        let captured = pending_prompt_ids_for(&pending, Some("sidA"));
-        assert_eq!(captured, vec![4]);
-
-        // Turn A's real RPC result lands, then the user immediately starts B.
-        pending.remove(&4);
-        let (second_tx, _second_rx) = oneshot::channel();
-        pending.insert(
-            5,
-            Pending {
-                method: "session/prompt".into(),
-                tx: second_tx,
-                session_id: Some("sidA".into()),
-            },
-        );
-
-        // The stale fallback exits and cannot remove the newer waiter.
-        assert!(!has_pending_prompt_ids(&pending, &captured));
-        assert!(take_pending_prompt_ids(&mut pending, &captured).is_empty());
-        assert!(pending.contains_key(&5));
-    }
 }
 
 #[cfg(test)]
@@ -6086,26 +5454,30 @@ mod prompt_wait_timeout_tests {
     fn idle() -> Duration {
         Duration::from_secs(PROMPT_IDLE_TIMEOUT_SECS)
     }
+    fn absolute() -> Duration {
+        Duration::from_secs(PROMPT_ABSOLUTE_TIMEOUT_SECS)
+    }
 
     #[test]
     fn healthy_activity_never_times_out() {
         let started = Instant::now();
         let last = started + Duration::from_secs(30 * 60);
         let now = last + Duration::from_secs(60);
-        // 30+ min wall clock, but last update 60s ago — under 1800s idle.
-        assert!(!prompt_wait_should_timeout(
-            Some(last),
-            started,
-            now,
-            idle()
-        ));
+        // 30+ min wall clock, but last update 60s ago — under 600s idle.
+        assert_eq!(
+            prompt_wait_should_timeout(Some(last), started, now, idle(), absolute()),
+            None
+        );
     }
 
     #[test]
     fn pure_silence_hits_idle() {
         let started = Instant::now();
         let now = started + idle();
-        assert!(prompt_wait_should_timeout(None, started, now, idle()));
+        assert_eq!(
+            prompt_wait_should_timeout(None, started, now, idle(), absolute()),
+            Some("idle")
+        );
     }
 
     #[test]
@@ -6113,21 +5485,21 @@ mod prompt_wait_timeout_tests {
         let started = Instant::now();
         let last = started + Duration::from_secs(10);
         let now = last + idle();
-        assert!(prompt_wait_should_timeout(Some(last), started, now, idle()));
+        assert_eq!(
+            prompt_wait_should_timeout(Some(last), started, now, idle(), absolute()),
+            Some("idle")
+        );
     }
 
     #[test]
-    fn long_running_with_fresh_updates_does_not_timeout() {
+    fn absolute_ceiling_even_with_fresh_updates() {
         let started = Instant::now();
-        // Former 4h absolute ceiling plus a bit — still healthy if progress is fresh.
-        let now = started + Duration::from_secs(5 * 60 * 60);
+        let now = started + absolute();
         let last = now - Duration::from_secs(1);
-        assert!(!prompt_wait_should_timeout(
-            Some(last),
-            started,
-            now,
-            idle()
-        ));
+        assert_eq!(
+            prompt_wait_should_timeout(Some(last), started, now, idle(), absolute()),
+            Some("absolute")
+        );
     }
 }
 
@@ -6222,25 +5594,6 @@ mod background_wait_policy_tests {
         assert_eq!(cli_supports_background_wait("grok 0.2.117"), Some(true));
         assert_eq!(cli_supports_background_wait("0.2.116"), Some(false));
         assert_eq!(cli_supports_background_wait(""), None);
-    }
-
-    #[test]
-    fn set_mode_stops_on_transport_errors_not_unknown_mode() {
-        assert!(set_mode_abort_remaining_candidates(
-            "rpc timeout on session/set_mode (id=5) after 45s"
-        ));
-        assert!(set_mode_abort_remaining_candidates(
-            "rpc channel closed while waiting for session/set_mode (id=6)"
-        ));
-        assert!(set_mode_abort_remaining_candidates(
-            "agent stdout closed before session/set_mode; process dead"
-        ));
-        assert!(!set_mode_abort_remaining_candidates(
-            "Method not found (code -32601)"
-        ));
-        assert!(!set_mode_abort_remaining_candidates(
-            "invalid params: unknown modeId"
-        ));
     }
 }
 
@@ -6382,41 +5735,6 @@ mod fork_session_spawn_tests {
 }
 
 #[cfg(test)]
-mod grok_build_proxy_spawn_tests {
-    use super::*;
-
-    #[test]
-    fn injects_native_proxy_env_only_on_target_command() {
-        let native = crate::providers::GrokBuildProxySpawn {
-            base_url: "https://relay.example/v1".into(),
-            models_url: "https://relay.example/v1/models".into(),
-            api_key: "runtime-only-key".into(),
-            model: "grok-4.6".into(),
-        };
-        let mut cmd = tokio::process::Command::new("grok");
-        apply_grok_build_proxy_env(&mut cmd, &native);
-        let envs = cmd
-            .as_std()
-            .get_envs()
-            .filter_map(|(k, v)| Some((k.to_str()?, v?.to_str()?)))
-            .collect::<std::collections::HashMap<_, _>>();
-        assert_eq!(
-            envs.get("GROK_MODELS_BASE_URL"),
-            Some(&"https://relay.example/v1")
-        );
-        assert_eq!(
-            envs.get("GROK_MODELS_LIST_URL"),
-            Some(&"https://relay.example/v1/models")
-        );
-        assert_eq!(
-            envs.get("GROK_CLI_CHAT_PROXY_BASE_URL"),
-            Some(&"https://relay.example/v1")
-        );
-        assert_eq!(envs.get("XAI_API_KEY"), Some(&"runtime-only-key"));
-    }
-}
-
-#[cfg(test)]
 mod agent_profile_spawn_tests {
     use super::*;
 
@@ -6495,6 +5813,7 @@ mod permission_mode_spawn_tests {
 
     #[test]
     fn maps_app_policies_to_cli_modes() {
+
         assert_eq!(cli_permission_mode("ask"), "default");
         assert_eq!(cli_permission_mode("accept_edits"), "acceptEdits");
         assert_eq!(cli_permission_mode("allow_for_session"), "default");
@@ -6578,21 +5897,6 @@ mod extra_rules_spawn_tests {
             args,
             vec!["--rules".to_string(), "Always write tests".to_string()]
         );
-    }
-}
-
-#[cfg(test)]
-mod folder_trust_spawn_tests {
-    use super::*;
-
-    #[test]
-    fn off_yields_no_flags() {
-        assert!(folder_trust_spawn_flags(false).is_empty());
-    }
-
-    #[test]
-    fn on_yields_trust_flag() {
-        assert_eq!(folder_trust_spawn_flags(true), vec!["--trust"]);
     }
 }
 
@@ -6925,63 +6229,6 @@ fn json_id_u64(v: Option<&Value>) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod cached_token_route_tests {
-    use super::*;
-
-    #[test]
-    fn unwrap_session_info_reads_the_pager_envelope() {
-        let raw = serde_json::json!({
-            "result": {
-                "sessionId": "s1",
-                "model": "grok-4.7",
-                "context": { "used": 3300, "total": 500000 }
-            }
-        });
-        let body = unwrap_session_info(raw).unwrap();
-        assert_eq!(body["model"], "grok-4.7");
-        assert_eq!(body["context"]["total"], 500000);
-    }
-
-    #[test]
-    fn unwrap_session_info_reads_a_string_envelope_and_surfaces_errors() {
-        let raw =
-            serde_json::json!(r#"{"result":{"sessionId":"s","context":{"used":1,"total":2}}}"#);
-        assert!(unwrap_session_info(raw).is_ok());
-        let err = unwrap_session_info(serde_json::json!({ "error": "no session" })).unwrap_err();
-        assert_eq!(err, "no session");
-    }
-
-    #[test]
-    fn rewind_unsupported_error_matches_method_not_found() {
-        // journal drop-last routes on this predicate: a mismatch would send
-        // the early-return error into the last-turn fallback retry path.
-        assert!(rpc_looks_like_method_not_found(
-            "rewind method not supported (not advertised by agent initialize)"
-        ));
-    }
-
-    #[test]
-    fn custom_route_must_not_authenticate_cached_token() {
-        // Official login leaves ~/.grok/auth.json for billing / official-aux.
-        // cached_token reads that file even when GROK_HOME is agent-home.
-        // Loading OIDC into a custom-relay process makes Grok Build send OIDC
-        // to the relay (HTTP 400/401) — "works until I sign in".
-        assert!(!should_authenticate_cached_token(true, true));
-        assert!(!should_authenticate_cached_token(true, false));
-    }
-
-    #[test]
-    fn official_route_authenticates_only_when_cached_token_exists() {
-        // Signed-in official: still send authenticate (and keep the #528
-        // re-sync + one retry on soft-fail).
-        assert!(should_authenticate_cached_token(false, true));
-        // Unsigned-in (no auth.json / no usable token): skip entirely.
-        // Sending authenticate here is a 12s × 2 timeout then soft-fail.
-        assert!(!should_authenticate_cached_token(false, false));
-    }
-}
-
-#[cfg(test)]
 mod live_handshake_tests {
     use super::*;
     use std::time::Duration;
@@ -7009,7 +6256,7 @@ mod live_handshake_tests {
             .expect("grok cli");
         let cwd = std::env::current_dir().unwrap();
         let t0 = std::time::Instant::now();
-        let (client, mut events) = AcpClient::spawn(cli, cwd).await.expect("spawn");
+        let (client, mut events) = AcpClient::spawn(cli, cwd).expect("spawn");
         // drain events in bg
         tokio::spawn(async move {
             while let Some((_sid, ev)) = events.recv().await {

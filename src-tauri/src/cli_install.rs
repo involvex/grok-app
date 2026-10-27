@@ -537,7 +537,7 @@ fn link_install(download_path: &Path, version: &str) -> Result<PathBuf, String> 
                 }
             }
         }
-        Ok(grok_exe)
+        return Ok(grok_exe);
     }
 
     #[cfg(not(target_os = "windows"))]

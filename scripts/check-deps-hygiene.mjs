@@ -1,17 +1,17 @@
 #!/usr/bin/env node
 /**
- * Dependency hygiene gates for the monorepo root (pnpm-only app).
+ * Dependency hygiene gates for the monorepo root (bun-only app).
  *
  * Enforces:
- *  - root package manager is pnpm (when invoked as preinstall / install hook)
+ *  - root package manager is bun (when invoked as preinstall / install hook)
  *  - root package-lock.json must not exist (stale npm lock regresses CVE pins)
- *  - pnpm-lock.yaml must exist
+ *  - bun.lockb or bun.lock must exist
  *
  * remote-bridge/ may keep its own package-lock.json (independent npm package).
  *
  * Usage:
- *   node scripts/check-deps-hygiene.mjs           # lockfile checks only
- *   node scripts/check-deps-hygiene.mjs --preinstall  # also reject npm/yarn installs
+ *   bun scripts/check-deps-hygiene.mjs           # lockfile checks only
+ *   bun scripts/check-deps-hygiene.mjs --preinstall  # also reject npm/yarn installs
  */
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -28,26 +28,27 @@ function fail(msg) {
 
 if (preinstall) {
   const ua = process.env.npm_config_user_agent || "";
-  // Allow pnpm; reject npm / yarn / bun install of the root tree.
-  if (!/\bpnpm\//.test(ua)) {
+  // Allow bun; reject npm / yarn / pnpm install of the root tree.
+  if (!/\bbun\//.test(ua)) {
     fail(
-      "Root package manager is pnpm only. Use `pnpm install` (do not use npm/yarn at repo root).",
+      "Root package manager is bun only. Use `bun install` (do not use npm/yarn/pnpm at repo root).",
     );
     fail(`Detected user-agent: ${ua || "(empty)"}`);
   }
 }
 
 const rootNpmLock = join(root, "package-lock.json");
-const pnpmLock = join(root, "pnpm-lock.yaml");
+const bunLock = join(root, "bun.lockb");
+const bunLockText = join(root, "bun.lock");
 
 if (existsSync(rootNpmLock)) {
   fail(
-    "Root package-lock.json must not exist. Delete it and rely on pnpm-lock.yaml. (remote-bridge/ may keep its own lockfile.)",
+    "Root package-lock.json must not exist. Delete it and rely on bun.lockb/bun.lock. (remote-bridge/ may keep its own lockfile.)",
   );
 }
 
-if (!existsSync(pnpmLock)) {
-  fail("pnpm-lock.yaml is required at the repository root.");
+if (!existsSync(bunLock) && !existsSync(bunLockText)) {
+  fail("bun.lockb or bun.lock is required at the repository root.");
 }
 
 if (failed) {
@@ -55,5 +56,5 @@ if (failed) {
 }
 
 if (!preinstall) {
-  console.log("deps-hygiene: ok (pnpm-only root, no stale package-lock.json)");
+  console.log("deps-hygiene: ok (bun-only root, no stale package-lock.json)");
 }

@@ -3,19 +3,13 @@
 #[tauri::command]
 pub async fn account_status(
     refresh_billing: Option<bool>,
-    include_local_usage: Option<bool>,
     manual_cli_path: Option<String>,
 ) -> Result<crate::account::AccountStatus, String> {
-    let settings = store::load_settings_async().await;
+    let settings = store::load_settings();
     let manual = manual_cli_path
         .or(settings.manual_cli_path)
         .filter(|s| !s.is_empty());
-    Ok(crate::account::account_status_opts(
-        manual.as_deref(),
-        refresh_billing.unwrap_or(true),
-        include_local_usage.unwrap_or(true),
-    )
-    .await)
+    Ok(crate::account::account_status(manual.as_deref(), refresh_billing.unwrap_or(true)).await)
 }
 
 #[tauri::command]
@@ -25,15 +19,15 @@ pub async fn account_login(
     method: Option<String>,
     manual_cli_path: Option<String>,
 ) -> Result<crate::account::LoginResult, String> {
-    let settings = store::load_settings_async().await;
+    let settings = store::load_settings();
     let manual = manual_cli_path
         .or(settings.manual_cli_path)
         .filter(|s| !s.is_empty());
     let method = method.unwrap_or_else(|| "oauth".into());
     let result = crate::account::account_login(&method, manual.as_deref()).await;
-    // Bind agent-home to the current route (official syncs OIDC; custom
-    // clears it) then drop warm/prewarm so the next send cannot reuse a CLI
-    // spawned with stale OIDC (sessionDisconnect alone only parks).
+    // Auth.json is synced into agent-home on success — drop warm/prewarm
+    // processes so the next send cannot reuse a CLI spawned with stale/missing
+    // credentials (sessionDisconnect alone only parks; connect prefers prewarm).
     if result.ok {
         mgr.recycle_all_agents(&app, "account_auth").await;
     }
@@ -62,7 +56,7 @@ pub async fn account_logout(
     mgr: State<'_, Arc<SessionManager>>,
     manual_cli_path: Option<String>,
 ) -> Result<crate::account::AccountProfile, String> {
-    let settings = store::load_settings_async().await;
+    let settings = store::load_settings();
     let manual = manual_cli_path
         .or(settings.manual_cli_path)
         .filter(|s| !s.is_empty());
@@ -91,14 +85,7 @@ pub fn accounts_list() -> crate::account_profiles::AccountsListResult {
 }
 
 #[tauri::command]
-pub async fn accounts_quota() -> crate::account_profiles::AccountsQuotaResult {
-    crate::account_profiles::fetch_accounts_quota().await
-}
-
-#[tauri::command]
-pub fn account_save_current(
-    label: Option<String>,
-) -> Result<crate::account_profiles::SavedAccount, String> {
+pub fn account_save_current(label: Option<String>) -> Result<crate::account_profiles::SavedAccount, String> {
     crate::account_profiles::save_current_account(label)
 }
 

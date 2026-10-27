@@ -5,18 +5,19 @@
 //!   - summary.json — title, timestamps, cwd
 //!   - chat_history.jsonl — line-delimited messages
 
+#![allow(dead_code)] // residual-clippy: pick_latest helper
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::paths::resolve_agent_grok_home;
 use crate::session_manager::{
-    extract_tool_input, tool_journal_richer, TOOL_OUTPUT_MAX_PUB, TOOL_OUTPUT_SENTINEL,
+    TOOL_OUTPUT_MAX_PUB, TOOL_OUTPUT_SENTINEL, extract_tool_input, tool_journal_richer,
 };
 use crate::store::{self, ChatMessageStored, MessageAttachmentStored, SessionMeta};
 
@@ -89,7 +90,6 @@ struct SummaryFile {
 #[derive(Debug, Deserialize)]
 struct SummaryInfo {
     #[serde(default)]
-    #[allow(dead_code)]
     id: Option<String>,
     #[serde(default)]
     cwd: Option<String>,
@@ -187,60 +187,9 @@ pub fn cwd_paths_match(a: &str, b: &str) -> bool {
     !na.is_empty() && na == nb
 }
 
-/// Whether a CLI cwd should become an untrusted App project on import (pure).
-///
-/// Skips filesystem roots, the user home, ancestors of home, and shallow
-/// folders whose depth relative to home is less than 2 (e.g. `~/Developer`,
-/// `/home/name/projects`, `C:\Users\name\Documents`). Real project folders
-/// (`~/Developer/foo`) sit at least two levels under home. When `home` is
-/// empty, refuse — relative depth cannot be measured.
-pub fn should_auto_add_project_path(path: &str, home: &str) -> bool {
-    let p = normalize_cwd_path(path);
-    if p.is_empty() || p == "/" || p == "." {
-        return false;
-    }
-    let bytes = p.as_bytes();
-    // Windows drive root: "c:" / "c:/"
-    if bytes.len() <= 3 && bytes.get(1) == Some(&b':') {
-        return false;
-    }
-    let home_n = normalize_cwd_path(home);
-    if home_n.is_empty() {
-        return false;
-    }
-    if p == home_n {
-        return false;
-    }
-    if home_n.starts_with(&format!("{p}/")) {
-        return false;
-    }
-    let prefix = format!("{home_n}/");
-    let Some(rest) = p.strip_prefix(&prefix) else {
-        return false;
-    };
-    rest.split('/').filter(|s| !s.is_empty()).count() >= 2
-}
-
-/// Create an untrusted App project for a CLI cwd when missing.
-/// Never auto-trusts. Missing / shallow / home paths are no-ops.
-fn ensure_untrusted_project_for_cwd(cwd: &str) {
-    let home = crate::process_util::user_home();
-    let home_s = home.to_string_lossy();
-    if !should_auto_add_project_path(cwd, home_s.as_ref()) {
-        return;
-    }
-    if !Path::new(cwd).is_dir() {
-        return;
-    }
-    if let Err(e) = store::add_project(cwd.to_string(), false) {
-        tracing::debug!("cli import skip project add {cwd}: {e}");
-    }
-}
-
 /// Pick the newest session among rows whose `cwd` matches `project_path` (pure).
 ///
 /// Compares `updated_at` lexicographically (RFC3339-friendly).
-#[allow(dead_code)]
 pub fn pick_latest_session_for_cwd<'a, T>(
     rows: &'a [T],
     project_path: &str,
@@ -991,9 +940,15 @@ pub fn read_first_user_prompt(dir: &Path) -> Option<String> {
             continue;
         }
         let content = v.get("content").map(content_to_text).unwrap_or_default();
-        let Some(content) = imported_user_content(&v, &content) else {
+        let content = content.trim().to_string();
+        if content.is_empty() {
             continue;
-        };
+        }
+        let content = extract_user_query(&content).unwrap_or(content);
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
         // Cap length for UI / filter.
         let capped: String = content.chars().take(500).collect();
         return Some(capped);
@@ -1096,11 +1051,6 @@ fn content_to_text(content: &Value) -> String {
 /// Parse CLI `chat_history.jsonl` into (role, content) pairs for the App journal.
 pub fn parse_chat_history_jsonl(path: &Path) -> Result<Vec<(String, String)>, String> {
     let raw = fs::read_to_string(path).map_err(|e| format!("read chat_history: {e}"))?;
-    parse_chat_history_text(&raw)
-}
-
-/// Same as [`parse_chat_history_jsonl`] for an already-read buffer (SSH import).
-pub fn parse_chat_history_text(raw: &str) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for line in raw.lines() {
         let line = line.trim();
@@ -1122,73 +1072,21 @@ pub fn parse_chat_history_text(raw: &str) -> Result<Vec<(String, String)>, Strin
             _ => continue,
         };
         let content = v.get("content").map(content_to_text).unwrap_or_default();
-        let content = if role == "user" {
-            match imported_user_content(&v, &content) {
-                Some(c) => c,
-                None => continue,
-            }
-        } else {
-            let content = content.trim().to_string();
-            if content.is_empty() {
-                continue;
-            }
-            content
-        };
+        let content = content.trim().to_string();
+        if content.is_empty() {
+            continue;
+        }
+        // Drop huge system-y user envelopes when possible — keep query body.
+        let content = extract_user_query(&content).unwrap_or(content);
+        if content.is_empty() {
+            continue;
+        }
         out.push((role.to_string(), content));
     }
     if out.is_empty() {
         return Err("no user/assistant messages in chat_history.jsonl".into());
     }
     Ok(out)
-}
-
-/// Fold ACP `updates.jsonl` text chunks into user/assistant pairs.
-pub fn parse_acp_updates_text(raw: &str) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut current: Option<(String, String)> = None;
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let Some(up) = v.pointer("/params/update").or_else(|| v.get("update")) else {
-            continue;
-        };
-        let kind = up
-            .get("sessionUpdate")
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        let role = match kind {
-            "user_message_chunk" => "user",
-            "agent_message_chunk" => "assistant",
-            _ => continue,
-        };
-        let text = up.get("content").map(content_to_text).unwrap_or_default();
-        if text.is_empty() {
-            continue;
-        }
-        match current.as_mut() {
-            Some((r, buf)) if r == role => buf.push_str(&text),
-            _ => {
-                if let Some(prev) = current.take() {
-                    if !prev.1.trim().is_empty() {
-                        out.push(prev);
-                    }
-                }
-                current = Some((role.to_string(), text));
-            }
-        }
-    }
-    if let Some(prev) = current {
-        if !prev.1.trim().is_empty() {
-            out.push(prev);
-        }
-    }
-    out
 }
 
 /// Walk CLI `chat_history.jsonl` in stream order keeping tool rows:
@@ -1216,18 +1114,14 @@ fn parse_chat_history_rows(path: &Path) -> Result<Vec<(String, String, Option<St
         match typ {
             "user" | "assistant" => {
                 let content = v.get("content").map(content_to_text).unwrap_or_default();
-                let content = if typ == "user" {
-                    match imported_user_content(&v, &content) {
-                        Some(c) => c,
-                        None => continue,
-                    }
-                } else {
-                    let content = content.trim().to_string();
-                    if content.is_empty() {
-                        continue;
-                    }
-                    content
-                };
+                let content = content.trim().to_string();
+                if content.is_empty() {
+                    continue;
+                }
+                let content = extract_user_query(&content).unwrap_or(content);
+                if content.is_empty() {
+                    continue;
+                }
                 out.push((typ.to_string(), content, None));
             }
             "tool_result" => {
@@ -1266,46 +1160,6 @@ fn extract_user_query(content: &str) -> Option<String> {
     }
 }
 
-fn chat_history_synthetic_reason(v: &Value) -> Option<&str> {
-    v.get("synthetic_reason")
-        .or_else(|| v.get("syntheticReason"))
-        .or_else(|| v.pointer("/_meta/synthetic_reason"))
-        .or_else(|| v.pointer("/metadata/synthetic_reason"))
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-}
-
-fn is_synthetic_instruction_reason(reason: &str) -> bool {
-    let r = reason.to_ascii_lowercase();
-    r == "project_instructions"
-        || r == "system_reminder"
-        || r == "user_instructions"
-        || r.contains("reminder")
-        || r.contains("instruction")
-}
-
-/// Official TUI paints `updates.jsonl`, not `chat_history.jsonl`. Import must
-/// not copy reminder-only / synthetic instruction envelopes as user bubbles.
-fn imported_user_content(v: &Value, raw: &str) -> Option<String> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Some(q) = extract_user_query(raw) {
-        return Some(q);
-    }
-    if raw.contains("<system-reminder>") || raw.contains("<user_info>") {
-        return None;
-    }
-    if let Some(reason) = chat_history_synthetic_reason(v) {
-        if is_synthetic_instruction_reason(reason) {
-            return None;
-        }
-    }
-    Some(raw.to_string())
-}
-
 /// Split display text + `@/abs/path` (or `@C:\path`) sole-line refs — mirrors FE
 /// `parseAttachmentsFromContent` so history cards can be recovered from agent
 /// chat_history when the App journal only kept the user-facing body.
@@ -1318,11 +1172,10 @@ pub fn parse_at_path_attachments(content: &str) -> (String, Vec<MessageAttachmen
     let mut seen = std::collections::HashSet::new();
     for line in content.lines() {
         let trimmed = line.trim();
-        // @/path or @C:\path — absolute only, and multi-segment for POSIX so
-        // `@/goal …` prose is not backfilled as a missing-file chip (#1197).
+        // @/path or @C:\path — absolute only (same as FE).
         let path = trimmed.strip_prefix('@').and_then(|rest| {
             let rest = rest.trim();
-            if is_sole_line_at_attachment_path(rest) {
+            if rest.starts_with('/') || looks_like_windows_abs(rest) {
                 Some(rest.to_string())
             } else {
                 None
@@ -1357,23 +1210,6 @@ pub fn parse_at_path_attachments(content: &str) -> (String, Vec<MessageAttachmen
 fn looks_like_windows_abs(path: &str) -> bool {
     let b = path.as_bytes();
     b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
-}
-
-/// Mirrors FE `isSoleLineAtAttachmentPath`: POSIX needs ≥2 segments so
-/// `/goal` / `/goal 你再检查…` stay as text; Windows drive needs ≥1 segment.
-fn is_sole_line_at_attachment_path(path: &str) -> bool {
-    let p = path.trim();
-    if p.is_empty() {
-        return false;
-    }
-    if looks_like_windows_abs(p) {
-        let rest = p[2..].trim_start_matches(['/', '\\']).replace('\\', "/");
-        return rest.split('/').filter(|s| !s.is_empty()).count() >= 1;
-    }
-    if !p.starts_with('/') || p.starts_with("//") {
-        return false;
-    }
-    p.split('/').filter(|s| !s.is_empty()).count() >= 2
 }
 
 fn user_body_key(content: &str) -> String {
@@ -1537,7 +1373,6 @@ fn load_tool_names_from_events(events_path: &std::path::Path) -> HashMap<String,
 struct ToolCallRecord {
     name: String,
     label: String,
-    #[allow(dead_code)]
     kind: String,
     input: Option<String>,
 }
@@ -1690,8 +1525,10 @@ pub fn reconcile_journal_from_chat_history(
     }
     // Tool identity + call arguments from the CLI's own update log
     // (terminal ACP updates are status-only; chat_history carries no input).
-    let tool_calls =
-        load_tool_calls_from_updates(&dir.join("updates.jsonl"), &dir.join("events.jsonl"));
+    let tool_calls = load_tool_calls_from_updates(
+        &dir.join("updates.jsonl"),
+        &dir.join("events.jsonl"),
+    );
     let rows = match parse_chat_history_rows(&history) {
         Ok(r) => r,
         Err(_) => return Ok(0),
@@ -1702,8 +1539,6 @@ pub fn reconcile_journal_from_chat_history(
         .map(|(role, content, _)| (role.clone(), content.clone()))
         .collect();
     let mut journal = store::load_messages(app_session_id);
-    let journal_users = store::user_prompt_count(&journal);
-    let mut seen_users = 0u32;
     let mut changed = 0u32;
     let now = Utc::now();
     // Insert anchor: journal index after which the next rebuilt tool row goes,
@@ -1712,15 +1547,6 @@ pub fn reconcile_journal_from_chat_history(
     let mut anchor: Option<usize> = journal.len().checked_sub(1);
 
     for (role, content, tool_call_id) in &rows {
-        if role == "user" {
-            seen_users = seen_users.saturating_add(1);
-            continue;
-        }
-        // A rewind leaves the journal shorter than chat_history.jsonl. Do not
-        // paste assistant or tool rows from turns that were cut.
-        if seen_users > journal_users {
-            continue;
-        }
         if role == "assistant" {
             match journal_covers_assistant(&journal, content) {
                 CoverKind::Covered(idx) => {
@@ -1754,9 +1580,7 @@ pub fn reconcile_journal_from_chat_history(
         if role != "tool" {
             continue;
         }
-        let Some(call_id) = tool_call_id else {
-            continue;
-        };
+        let Some(call_id) = tool_call_id else { continue };
         if call_id.is_empty() {
             continue;
         }
@@ -1850,15 +1674,6 @@ pub fn reconcile_journal_from_chat_history(
     Ok(changed)
 }
 
-/// Linked reconcile may rebuild the App journal from agent `chat_history`.
-/// Skip while a **partial** fork is still pending (`fork_agent_session` plus a
-/// rewind index): the child journal is intentionally shorter than parent
-/// history, so a reconcile would overwrite the cut. Full forks and ordinary
-/// linked sessions stay eligible.
-fn linked_reconcile_allowed(meta: &SessionMeta) -> bool {
-    !(meta.fork_agent_session && meta.fork_rewind_prompt_index.is_some())
-}
-
 /// Best-effort reconcile when opening an App session that is linked to an agent.
 /// Never fails the load path — missing agent dir is normal for brand-new chats.
 pub fn try_reconcile_linked_session(app_session_id: &str) -> u32 {
@@ -1868,9 +1683,6 @@ pub fn try_reconcile_linked_session(app_session_id: &str) -> u32 {
     let Some(meta) = meta else {
         return 0;
     };
-    if !linked_reconcile_allowed(&meta) {
-        return 0;
-    }
     let Some(agent_id) = meta.agent_session_id.as_deref().filter(|s| !s.is_empty()) else {
         return 0;
     };
@@ -1881,12 +1693,8 @@ pub fn try_reconcile_linked_session(app_session_id: &str) -> u32 {
             .find(|p| p.id == pid)
             .map(|p| p.path)
     });
-    let changed =
-        reconcile_journal_from_chat_history(app_session_id, agent_id, cwd_hint.as_deref(), &mode)
-            .unwrap_or(0);
-    // Do not heal here: session_messages / post-turn reconcile can run while
-    // this process still has a live prompt. Boot + connect heal instead.
-    changed
+    reconcile_journal_from_chat_history(app_session_id, agent_id, cwd_hint.as_deref(), &mode)
+        .unwrap_or(0)
 }
 
 /// Import one CLI session into the App journal (independent App session row).
@@ -1901,8 +1709,6 @@ pub fn import_cli_session(
     project_id: Option<String>,
     session_data_mode: &str,
 ) -> Result<SessionMeta, String> {
-    let agent_session_id = validate_agent_session_id(agent_session_id)?;
-
     // Already linked? Skip re-import and return the existing app session.
     if let Some(existing) = store::load_sessions_index()
         .into_iter()
@@ -1910,8 +1716,6 @@ pub fn import_cli_session(
     {
         return Ok(existing);
     }
-    // Explicit one-id import may revive a previously deleted App link.
-    let _ = forget_deleted_cli_id(agent_session_id);
 
     let dir = if let Some(d) = dir.filter(|s| !s.is_empty()) {
         PathBuf::from(d)
@@ -1938,14 +1742,16 @@ pub fn import_cli_session(
     let history = dir.join("chat_history.jsonl");
     let pairs = parse_chat_history_jsonl(&history)?;
 
-    // Prefer matching App project by path. Missing project folders from a
-    // real CLI cwd are added untrusted — user still confirms trust.
+    // Prefer matching App project by path.
     let project_id = project_id.or_else(|| {
         let cwd = cwd.as_deref()?;
-        ensure_untrusted_project_for_cwd(cwd);
         store::load_projects()
             .into_iter()
-            .find(|p| cwd_paths_match(&p.path, cwd))
+            .find(|p| {
+                let a = p.path.trim_end_matches('/').trim_end_matches('\\');
+                let b = cwd.trim_end_matches('/').trim_end_matches('\\');
+                a == b
+            })
             .map(|p| p.id)
     });
 
@@ -1969,116 +1775,14 @@ pub fn import_cli_session(
     store::save_messages(&meta.id, &msgs)?;
     meta.updated_at = now;
     // Persist agent_session_id link.
-    let sid = meta.id.clone();
-    let agent_session_id = meta.agent_session_id.clone();
-    if let Some(updated) = store::update_sessions_index(move |list| {
-        let Some(row) = list.iter_mut().find(|s| s.id == sid) else {
-            return Ok(None);
-        };
-        row.agent_session_id = agent_session_id;
+    let mut list = store::load_sessions_index();
+    if let Some(row) = list.iter_mut().find(|s| s.id == meta.id) {
+        row.agent_session_id = meta.agent_session_id.clone();
         row.updated_at = now;
-        Ok(Some(row.clone()))
-    })? {
-        meta = updated;
+        meta = row.clone();
     }
+    store::save_sessions_index(&list)?;
     Ok(meta)
-}
-
-#[derive(Default, Serialize, Deserialize)]
-struct DeletedCliSessionsFile {
-    #[serde(default)]
-    ids: Vec<String>,
-}
-
-fn deleted_cli_sessions_path() -> PathBuf {
-    crate::paths::app_data_root().join("deleted_cli_sessions.json")
-}
-
-fn load_deleted_cli_ids() -> Vec<String> {
-    let path = deleted_cli_sessions_path();
-    if !path.is_file() {
-        return Vec::new();
-    }
-    let file: DeletedCliSessionsFile = crate::store::read_json_recover(&path);
-    file.ids
-}
-
-/// Record an agent session id so bulk import will not recreate an App row
-/// after the user deleted the chat (#1236).
-pub fn remember_deleted_cli_id(agent_session_id: &str) -> Result<(), String> {
-    let id = validate_agent_session_id(agent_session_id)?.to_string();
-    let mut ids = load_deleted_cli_ids();
-    if ids.iter().any(|x| x == &id) {
-        return Ok(());
-    }
-    ids.push(id);
-    if ids.len() > 500 {
-        let drop_n = ids.len() - 500;
-        ids.drain(0..drop_n);
-    }
-    crate::store::write_json(
-        &deleted_cli_sessions_path(),
-        &DeletedCliSessionsFile { ids },
-    )
-}
-
-pub fn forget_deleted_cli_id(agent_session_id: &str) -> Result<(), String> {
-    let id = agent_session_id.trim();
-    if id.is_empty() {
-        return Ok(());
-    }
-    let mut ids = load_deleted_cli_ids();
-    let before = ids.len();
-    ids.retain(|x| x != id);
-    if ids.len() == before {
-        return Ok(());
-    }
-    crate::store::write_json(
-        &deleted_cli_sessions_path(),
-        &DeletedCliSessionsFile { ids },
-    )
-}
-
-pub fn is_deleted_cli_id(agent_session_id: &str) -> bool {
-    let id = agent_session_id.trim();
-    !id.is_empty() && load_deleted_cli_ids().iter().any(|x| x == id)
-}
-
-/// True for CLI stubs / non-project cwd that bulk import should not resurrect.
-pub fn should_skip_bulk_cli_import(title: &str, cwd: Option<&str>, num_messages: u32) -> bool {
-    if is_noise_cli_cwd(cwd) {
-        return true;
-    }
-    let t = title.trim();
-    let stub_title = t.is_empty() || t.starts_with("CLI ");
-    stub_title && num_messages <= 2
-}
-
-fn is_noise_cli_cwd(cwd: Option<&str>) -> bool {
-    let Some(cwd) = cwd.map(normalize_cwd_path).filter(|s| !s.is_empty()) else {
-        return false;
-    };
-    cwd.ends_with("/windows/system32")
-        || cwd.ends_with("/system32")
-        || cwd.contains("/workspaces/general")
-}
-
-/// App deleted this chat: tombstone the agent id and remove the CLI directory.
-/// Tombstone remains if the directory is locked (Windows) so import_all cannot
-/// recreate a sidebar row (#1236).
-pub fn forget_app_linked_cli_session(
-    agent_session_id: &str,
-    session_data_mode: &str,
-) -> Result<(), String> {
-    let _ = remember_deleted_cli_id(agent_session_id);
-    if let Err(e) = delete_cli_session(agent_session_id, None, session_data_mode) {
-        tracing::warn!(
-            target: "session",
-            agent = %agent_session_id,
-            "cli session dir not removed after app delete: {e}"
-        );
-    }
-    Ok(())
 }
 
 /// Import all not-yet-linked CLI sessions (capped).
@@ -2088,13 +1792,7 @@ pub fn import_all_cli_sessions(
 ) -> Result<Vec<SessionMeta>, String> {
     let list = list_cli_sessions(session_data_mode)?;
     let mut imported = Vec::new();
-    for s in list
-        .into_iter()
-        .filter(|s| !s.already_linked)
-        .filter(|s| !is_deleted_cli_id(&s.agent_session_id))
-        .filter(|s| !should_skip_bulk_cli_import(&s.title, s.cwd.as_deref(), s.num_messages))
-        .take(limit)
-    {
+    for s in list.into_iter().filter(|s| !s.already_linked).take(limit) {
         match import_cli_session(&s.agent_session_id, Some(&s.dir), None, session_data_mode) {
             Ok(m) => imported.push(m),
             Err(e) => tracing::warn!("cli import skip {}: {e}", s.agent_session_id),
@@ -2242,23 +1940,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_acp_updates_concatenates_chunks() {
-        let raw = r#"
-{"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Hi"}}}}
-{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello "}}}}
-{"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"world."}}}}
-"#;
-        let pairs = parse_acp_updates_text(raw);
-        assert_eq!(
-            pairs,
-            vec![
-                ("user".into(), "Hi".into()),
-                ("assistant".into(), "Hello world.".into()),
-            ]
-        );
-    }
-
-    #[test]
     fn parse_jsonl_user_assistant() {
         let dir = std::env::temp_dir().join(format!("cli-hist-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -2277,44 +1958,6 @@ mod tests {
         assert_eq!(pairs[0].1, "hello world");
         assert_eq!(pairs[1].0, "assistant");
         assert_eq!(pairs[1].1, "hi there");
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn parse_jsonl_skips_system_reminder_user_envelopes() {
-        let dir = std::env::temp_dir().join(format!("cli-hist-reminder-{}", Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("chat_history.jsonl");
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"user","synthetic_reason":"project_instructions","content":"<system-reminder>\nFollow AGENTS.md\n</system-reminder>"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"user","content":"<system-reminder>\nAlso this\n</system-reminder>"}}"#
-        )
-        .unwrap();
-        writeln!(
-            f,
-            r#"{{"type":"user","content":"<system-reminder>\nctx\n</system-reminder>\n<user_query>\nreal question\n</user_query>"}}"#
-        )
-        .unwrap();
-        writeln!(f, r#"{{"type":"assistant","content":"ok"}}"#).unwrap();
-        let pairs = parse_chat_history_jsonl(&path).unwrap();
-        assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].0, "user");
-        assert_eq!(pairs[0].1, "real question");
-        assert_eq!(pairs[1].0, "assistant");
-        assert_eq!(pairs[1].1, "ok");
-
-        let rows = parse_chat_history_rows(&path).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].1, "real question");
-
-        let first = read_first_user_prompt(&dir).unwrap();
-        assert_eq!(first, "real question");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2340,15 +1983,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_at_path_attachments_keeps_at_goal_prose() {
-        let raw = "两句说明\n\n@/goal 你再检查优化一下吧\n\n@/tmp/notes.md";
-        let (text, atts) = parse_at_path_attachments(raw);
-        assert_eq!(text, "两句说明\n\n@/goal 你再检查优化一下吧");
-        assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0].path, "/tmp/notes.md");
-    }
-
-    #[test]
     fn load_tool_names_from_events_parses_tool_name() {
         let dir = std::env::temp_dir().join(format!("cli-evt-{}", Uuid::new_v4()));
         fs::create_dir_all(&dir).unwrap();
@@ -2364,11 +1998,7 @@ mod tests {
             r#"{{"ts":"x","type":"tool_completed","tool_name":"run_terminal_command","tool_call_id":"call-2"}}"#
         )
         .unwrap();
-        writeln!(
-            f,
-            r#"{{"ts":"x","type":"phase_changed","phase":"execute"}}"#
-        )
-        .unwrap();
+        writeln!(f, r#"{{"ts":"x","type":"phase_changed","phase":"execute"}}"#).unwrap();
         let names = load_tool_names_from_events(&path);
         assert_eq!(names.get("call-1").map(String::as_str), Some("read_file"));
         assert_eq!(
@@ -2395,7 +2025,11 @@ mod tests {
             r#"{{"type":"tool_result","tool_call_id":"call-16","content":"1→skill body"}}"#
         )
         .unwrap();
-        writeln!(h, r#"{{"type":"assistant","content":"正在构建信息图。"}}"#).unwrap();
+        writeln!(
+            h,
+            r#"{{"type":"assistant","content":"正在构建信息图。"}}"#
+        )
+        .unwrap();
         writeln!(
             h,
             r#"{{"type":"tool_result","tool_call_id":"call-17","content":"exit: 0\nok"}}"#
@@ -2463,16 +2097,12 @@ mod tests {
         ];
         let rows = parse_chat_history_rows(&dir.join("chat_history.jsonl")).unwrap();
         assert_eq!(rows.len(), 6);
-        let tool_calls =
-            load_tool_calls_from_updates(&dir.join("updates.jsonl"), &dir.join("events.jsonl"));
-        assert_eq!(
-            tool_calls.get("call-16").map(|r| r.name.as_str()),
-            Some("read_file")
+        let tool_calls = load_tool_calls_from_updates(
+            &dir.join("updates.jsonl"),
+            &dir.join("events.jsonl"),
         );
-        assert_eq!(
-            tool_calls.get("call-16").map(|r| r.label.as_str()),
-            Some("Read")
-        );
+        assert_eq!(tool_calls.get("call-16").map(|r| r.name.as_str()), Some("read_file"));
+        assert_eq!(tool_calls.get("call-16").map(|r| r.label.as_str()), Some("Read"));
         assert_eq!(
             tool_calls.get("call-16").and_then(|r| r.input.as_deref()),
             Some("/Users/me/notes.md")
@@ -2571,15 +2201,11 @@ mod tests {
 
         // tool-call-16 upgraded from sparse to named read_file with input.
         let t16 = journal.iter().find(|m| m.id == "tool-call-16").unwrap();
-        assert!(t16
-            .content
-            .starts_with("tool_step|completed|read_file|Read"));
+        assert!(t16.content.starts_with("tool_step|completed|read_file|Read"));
         assert!(t16.content.contains("input:/Users/me/notes.md"));
         // call-17 keeps the rich label + command input.
         let t17 = journal.iter().find(|m| m.id == "tool-call-17").unwrap();
-        assert!(t17
-            .content
-            .starts_with("tool_step|completed|run_terminal_command|Run Command"));
+        assert!(t17.content.starts_with("tool_step|completed|run_terminal_command|Run Command"));
         assert!(t17.content.contains("input:ls -la"));
         // call-17 inserted in stream order between its fragments.
         let order: Vec<&str> = journal.iter().map(|m| m.id.as_str()).collect();
@@ -2682,28 +2308,12 @@ mod tests {
         assert!(validate_agent_session_id("sess-ok-123").is_ok());
     }
 
-    #[test]
-    fn import_cli_session_rejects_traversal_ids_before_path_join() {
-        // Must fail closed on the id itself — never scan sessions or join `..`.
-        for id in ["", "   ", "../etc", "a/b", "a\\b", "..", "sess/../x"] {
-            let err = import_cli_session(id, None, None, "shared").unwrap_err();
-            assert!(
-                err.contains("invalid agent_session_id") || err.contains("empty agent_session_id"),
-                "id {id:?} → {err}"
-            );
-        }
-    }
-
     fn make_fake_cli_session(home: &Path, agent_id: &str) -> PathBuf {
         let cwd_enc = percent_encode_path_component("/Users/me/proj");
         let dir = home.join("sessions").join(cwd_enc).join(agent_id);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("summary.json"), r#"{"generated_title":"t"}"#).unwrap();
-        fs::write(
-            dir.join("chat_history.jsonl"),
-            "{\"type\":\"user\",\"content\":\"hi\"}\n{\"type\":\"assistant\",\"content\":\"ok\"}\n",
-        )
-        .unwrap();
+        fs::write(dir.join("chat_history.jsonl"), "").unwrap();
         dir
     }
 
@@ -2807,140 +2417,6 @@ mod tests {
     }
 
     #[test]
-    fn skip_bulk_import_drops_stubs_and_noise_cwds() {
-        assert!(should_skip_bulk_cli_import("CLI ab12cd34", None, 1));
-        assert!(should_skip_bulk_cli_import("", None, 2));
-        assert!(should_skip_bulk_cli_import(
-            "real title",
-            Some(r"C:\Windows\System32"),
-            20
-        ));
-        assert!(should_skip_bulk_cli_import(
-            "real title",
-            Some("/Users/me/Library/Application Support/com.grokapp.grok-app/workspaces/general"),
-            4
-        ));
-        assert!(!should_skip_bulk_cli_import(
-            "Fix login",
-            Some("/Users/me/proj"),
-            2
-        ));
-        assert!(!should_skip_bulk_cli_import(
-            "CLI leftover",
-            Some("/Users/me/proj"),
-            12
-        ));
-    }
-
-    #[test]
-    fn import_all_does_not_resurrect_deleted_app_session() {
-        use crate::paths::APP_HOME_ENV_LOCK;
-
-        let _guard = APP_HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let app_home = std::env::temp_dir().join(format!("cli-resurrect-{}", Uuid::new_v4()));
-        let _ = fs::remove_dir_all(&app_home);
-        fs::create_dir_all(&app_home).unwrap();
-        std::env::set_var("GROK_APP_HOME", &app_home);
-        let _ = crate::paths::ensure_app_dirs();
-
-        let agent_home = crate::paths::agent_home_dir();
-        let agent_id = "agent-resurrect-aaaa";
-        let dir = make_fake_cli_session(&agent_home, agent_id);
-
-        let imported =
-            import_cli_session(agent_id, Some(dir.to_str().unwrap()), None, "independent")
-                .expect("import");
-        assert_eq!(imported.agent_session_id.as_deref(), Some(agent_id));
-
-        forget_app_linked_cli_session(agent_id, "independent").expect("forget cli");
-        crate::store::delete_session(&imported.id).expect("delete app");
-
-        assert!(!dir.exists(), "CLI dir should be gone");
-        let again = import_all_cli_sessions("independent", 50).expect("import all");
-        assert!(
-            again.is_empty(),
-            "bulk import resurrected {:?}",
-            again.iter().map(|s| s.id.clone()).collect::<Vec<_>>()
-        );
-        assert!(
-            crate::store::load_sessions_index()
-                .iter()
-                .all(|s| s.agent_session_id.as_deref() != Some(agent_id)),
-            "index grew a new row for the deleted agent id"
-        );
-
-        std::env::remove_var("GROK_APP_HOME");
-        let _ = fs::remove_dir_all(&app_home);
-    }
-
-    #[test]
-    fn import_all_skips_tombstoned_id_even_if_cli_dir_remains() {
-        use crate::paths::APP_HOME_ENV_LOCK;
-
-        let _guard = APP_HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let app_home = std::env::temp_dir().join(format!("cli-tombstone-{}", Uuid::new_v4()));
-        let _ = fs::remove_dir_all(&app_home);
-        fs::create_dir_all(&app_home).unwrap();
-        std::env::set_var("GROK_APP_HOME", &app_home);
-        let _ = crate::paths::ensure_app_dirs();
-
-        let agent_home = crate::paths::agent_home_dir();
-        let agent_id = "agent-tombstone-cccc";
-        let dir = make_fake_cli_session(&agent_home, agent_id);
-        let imported =
-            import_cli_session(agent_id, Some(dir.to_str().unwrap()), None, "independent")
-                .expect("import");
-        remember_deleted_cli_id(agent_id).expect("tombstone");
-        crate::store::delete_session(&imported.id).expect("delete app");
-        assert!(dir.is_dir(), "CLI dir still on disk");
-
-        let again = import_all_cli_sessions("independent", 50).expect("import all");
-        assert!(
-            again.is_empty(),
-            "tombstone should block resurrection, got {}",
-            again.len()
-        );
-
-        std::env::remove_var("GROK_APP_HOME");
-        let _ = fs::remove_dir_all(&app_home);
-    }
-
-    #[test]
-    fn archived_row_is_already_linked_so_import_all_skips() {
-        use crate::paths::APP_HOME_ENV_LOCK;
-
-        let _guard = APP_HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let app_home = std::env::temp_dir().join(format!("cli-arch-{}", Uuid::new_v4()));
-        let _ = fs::remove_dir_all(&app_home);
-        fs::create_dir_all(&app_home).unwrap();
-        std::env::set_var("GROK_APP_HOME", &app_home);
-        let _ = crate::paths::ensure_app_dirs();
-
-        let agent_home = crate::paths::agent_home_dir();
-        let agent_id = "agent-archived-bbbb";
-        let dir = make_fake_cli_session(&agent_home, agent_id);
-        let imported =
-            import_cli_session(agent_id, Some(dir.to_str().unwrap()), None, "independent")
-                .expect("import");
-        crate::store::set_session_archived(&imported.id, true).expect("archive");
-
-        let list = list_cli_sessions("independent").expect("list");
-        let row = list
-            .iter()
-            .find(|s| s.agent_session_id == agent_id)
-            .unwrap();
-        assert!(row.already_linked);
-        assert_eq!(row.app_session_id.as_deref(), Some(imported.id.as_str()));
-
-        let again = import_all_cli_sessions("independent", 50).expect("import all");
-        assert!(again.is_empty());
-
-        let _ = crate::store::delete_session(&imported.id);
-        std::env::remove_var("GROK_APP_HOME");
-        let _ = fs::remove_dir_all(&app_home);
-    }
-
-    #[test]
     fn pick_latest_session_for_cwd_picks_newest() {
         #[derive(Debug)]
         struct Row {
@@ -2980,7 +2456,7 @@ mod tests {
     fn find_latest_prefers_newest_under_encoded_cwd() {
         use crate::paths::{percent_encode_path_component, APP_HOME_ENV_LOCK};
 
-        let _guard = APP_HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = APP_HOME_ENV_LOCK.lock().unwrap();
         let app_home = std::env::temp_dir().join(format!("cli-cont-{}", Uuid::new_v4()));
         let agent_home = app_home.join("agent-home");
         let proj = "/Users/me/continue-proj";
@@ -3044,7 +2520,7 @@ mod tests {
     fn find_latest_matches_trailing_slash_variant() {
         use crate::paths::{percent_encode_path_component, APP_HOME_ENV_LOCK};
 
-        let _guard = APP_HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = APP_HOME_ENV_LOCK.lock().unwrap();
         let app_home = std::env::temp_dir().join(format!("cli-cont2-{}", Uuid::new_v4()));
         let agent_home = app_home.join("agent-home");
         let proj = "/Users/me/slash-proj";
@@ -3147,86 +2623,5 @@ Total: 1
         assert_eq!(clamp_search_limit(Some(0)), 1);
         assert_eq!(clamp_search_limit(Some(200)), 100);
         assert_eq!(clamp_search_limit(Some(25)), 25);
-    }
-
-    #[test]
-    fn auto_add_project_path_skips_home_and_roots() {
-        let home = "/Users/prax";
-        assert!(should_auto_add_project_path(
-            "/Users/prax/Developer/money-manager-reverse-engineering",
-            home
-        ));
-        assert!(should_auto_add_project_path(
-            "/Users/prax/Developer/PraxAutomations/prax-daily",
-            home
-        ));
-        assert!(!should_auto_add_project_path("/", home));
-        assert!(!should_auto_add_project_path("/Users/prax", home));
-        assert!(!should_auto_add_project_path("/Users/prax/Developer", home));
-        assert!(!should_auto_add_project_path("C:\\", "C:\\Users\\prax"));
-        assert!(!should_auto_add_project_path("", home));
-    }
-
-    #[test]
-    fn auto_add_project_path_uses_home_relative_depth() {
-        // Linux: `/home/name/projects` is only one level under home.
-        let linux_home = "/home/name";
-        assert!(!should_auto_add_project_path("/home/name", linux_home));
-        assert!(!should_auto_add_project_path(
-            "/home/name/projects",
-            linux_home
-        ));
-        assert!(should_auto_add_project_path(
-            "/home/name/projects/grok-app",
-            linux_home
-        ));
-        assert!(!should_auto_add_project_path(
-            "/opt/company/app",
-            linux_home
-        ));
-
-        // Windows: drive letter inflates absolute segment count.
-        let win_home = r"C:\Users\prax";
-        assert!(!should_auto_add_project_path(r"C:\Users\prax", win_home));
-        assert!(!should_auto_add_project_path(
-            r"C:\Users\prax\Documents",
-            win_home
-        ));
-        assert!(should_auto_add_project_path(
-            r"C:\Users\prax\Documents\grok-app",
-            win_home
-        ));
-        assert!(!should_auto_add_project_path(r"D:\work\app", win_home));
-
-        // Missing home → conservative reject, even for a deep path.
-        assert!(!should_auto_add_project_path(
-            "/home/name/projects/grok-app",
-            ""
-        ));
-    }
-
-    fn fork_meta(fork: bool, rewind: Option<u32>) -> SessionMeta {
-        let mut meta: SessionMeta = serde_json::from_str(
-            r#"{"id":"s1","projectId":null,"title":"t","agentSessionId":"agent-1","createdAt":"2020-01-01T00:00:00Z","updatedAt":"2020-01-01T00:00:00Z"}"#,
-        )
-        .expect("session meta");
-        meta.fork_agent_session = fork;
-        meta.fork_rewind_prompt_index = rewind;
-        meta
-    }
-
-    #[test]
-    fn linked_reconcile_skips_pending_partial_fork() {
-        assert!(!linked_reconcile_allowed(&fork_meta(true, Some(4))));
-    }
-
-    #[test]
-    fn linked_reconcile_allows_pending_full_fork() {
-        assert!(linked_reconcile_allowed(&fork_meta(true, None)));
-    }
-
-    #[test]
-    fn linked_reconcile_allows_ordinary_linked_session() {
-        assert!(linked_reconcile_allowed(&fork_meta(false, None)));
     }
 }

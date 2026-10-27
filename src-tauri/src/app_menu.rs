@@ -7,8 +7,8 @@
 
 use tauri::{
     menu::{
-        AboutMetadata, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu, HELP_SUBMENU_ID,
-        WINDOW_SUBMENU_ID,
+        AboutMetadata, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu,
+        HELP_SUBMENU_ID, WINDOW_SUBMENU_ID,
     },
     AppHandle, Emitter, Manager, WebviewWindow, Wry,
 };
@@ -112,7 +112,10 @@ pub fn build_menu(app: &AppHandle) -> Result<Menu<Wry>, tauri::Error> {
         app,
         "File",
         true,
-        &[&close_primary, &PredefinedMenuItem::quit(app, None)?],
+        &[
+            &close_primary,
+            &PredefinedMenuItem::quit(app, None)?,
+        ],
     )?;
     #[cfg(target_os = "macos")]
     let file_menu = Submenu::with_items(app, "File", true, &[&close_primary])?;
@@ -143,37 +146,31 @@ pub fn build_menu(app: &AppHandle) -> Result<Menu<Wry>, tauri::Error> {
     #[cfg(target_os = "macos")]
     let menu = Menu::with_items(
         app,
-        &[
-            &app_submenu,
-            &file_menu,
-            &edit_menu,
-            &view_menu,
-            &window_menu,
-            &help_menu,
-        ],
+        &[&app_submenu, &file_menu, &edit_menu, &view_menu, &window_menu, &help_menu],
     )?;
     #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
-    let menu = Menu::with_items(app, &[&file_menu, &edit_menu, &window_menu, &help_menu])?;
+    let menu = Menu::with_items(
+        app,
+        &[&file_menu, &edit_menu, &window_menu, &help_menu],
+    )?;
     #[cfg(target_os = "linux")]
     let menu = Menu::with_items(app, &[&edit_menu, &window_menu, &help_menu])?;
 
     Ok(menu)
 }
 
-/// Native File/Window "Close" label. Shares the tray catalog so a new locale
-/// only has to be translated once (see `tray_i18n::TrayStrings::close`).
 fn close_menu_label() -> String {
-    crate::tray_i18n::t().close.to_string()
+    match crate::tray_i18n::app_locale() {
+        crate::tray_i18n::Locale::Zh => "关闭".into(),
+        crate::tray_i18n::Locale::ZhTw => "關閉".into(),
+        crate::tray_i18n::Locale::En => "Close".into(),
+    }
 }
 
 /// Install the menu (replaces the auto default that binds ⌘W → window close).
 pub fn install(app: &AppHandle) -> Result<(), String> {
     let menu = build_menu(app).map_err(|e| e.to_string())?;
     app.set_menu(menu).map_err(|e| e.to_string())?;
-    // App-wide set_menu reattaches File/Edit/Window/Help to windows that have
-    // no menu of their own. Keep non-document windows chrome-less.
-    crate::pet_window::reassert_overlay_chrome(app);
-    crate::wallpaper_grok_album::reassert_window_chrome(app);
     Ok(())
 }
 
@@ -192,11 +189,6 @@ fn dispatch_close_tab_or_window(app: &AppHandle) {
         return;
     };
     // Secondary session windows have no side-tab strip — close for real.
-    // The pet overlay is not a document window: hide it so prefs stay in sync.
-    if win.label() == crate::pet_window::PET_WINDOW_LABEL {
-        let _ = crate::pet_window::hide_pet(app);
-        return;
-    }
     if win.label() != "main" {
         let _ = win.close();
         return;
@@ -205,9 +197,12 @@ fn dispatch_close_tab_or_window(app: &AppHandle) {
 }
 
 fn focused_webview(app: &AppHandle) -> Option<WebviewWindow> {
-    app.webview_windows()
-        .into_values()
-        .find(|w| w.is_focused().unwrap_or(false))
+    for (_, w) in app.webview_windows() {
+        if w.is_focused().unwrap_or(false) {
+            return Some(w);
+        }
+    }
+    None
 }
 
 /// Refresh labels when the user changes locale in Settings (best-effort).

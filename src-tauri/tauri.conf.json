@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Grok",
-  "version": "0.2.45",
+  "version": "0.2.15",
   "identifier": "com.grokapp.desktop",
   "build": {
-    "beforeDevCommand": "pnpm dev:ui",
+    "beforeDevCommand": "bun run dev:ui",
     "devUrl": "http://localhost:1421",
-    "beforeBuildCommand": "pnpm build:ui",
+    "beforeBuildCommand": "bun run build:ui",
     "frontendDist": "../dist"
   },
   "app": {
@@ -53,10 +53,7 @@
             "$APPDATA/**/secrets.json"
           ]
         }
-      },
-      "dangerousDisableAssetCspModification": [
-        "style-src"
-      ]
+      }
     }
   },
   "bundle": {
@@ -76,17 +73,6 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ],
-    "fileAssociations": [
-      {
-        "ext": [
-          "grokskin"
-        ],
-        "name": "Grok Skin Pack",
-        "description": "Grok appearance skin pack",
-        "role": "Editor",
-        "mimeType": "application/vnd.grok.skin"
-      }
     ],
     "windows": {
       "webviewInstallMode": {
@@ -117,20 +103,12 @@
       }
     },
     "macOS": {
-      "infoPlist": "Info.plist",
-      "entitlements": "Entitlements.plist"
+      "infoPlist": "Info.plist"
     }
   },
   "plugins": {
     "updater": {
       "endpoints": []
-    },
-    "deep-link": {
-      "desktop": {
-        "schemes": [
-          "grok"
-        ]
-      }
     }
   }
 }

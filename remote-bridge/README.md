@@ -1,11 +1,10 @@
 # remote-bridge (historical / reference)
 
-> **Deprecated for Grok App runtime — do not extend.**  
+> **Deprecated for Grok App runtime.**  
 > Remote IM connectors now run **in-process in Rust**: `src-tauri/src/remote_im/`.  
-> Host does **not** spawn this Node package; it is not part of the pnpm
-> workspace, not type-checked in CI, and has no test coverage.
+> Host does **not** spawn this Node package.
 
-This directory remains as a protocol reference (Feishu long-connection, engine ideas) migrated from agent-connect. Do not install `@ronglecat/agent-connect` for the App. Fixes to Remote IM behavior belong in `src-tauri/src/remote_im/`, not here.
+This directory remains as a protocol reference (Feishu long-connection, engine ideas) migrated from agent-connect. Do not install `@ronglecat/agent-connect` for the App.
 
 Active path:
 
