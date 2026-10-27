@@ -3,7 +3,6 @@
 //! CLI: `--experimental-memory` / `--no-memory`, `GROK_MEMORY`, `[memory] enabled`,
 //! `grok memory clear`.
 
-#![allow(dead_code)] // residual-clippy: search helpers
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,6 +31,7 @@ pub fn memory_spawn_env_value(enabled: bool) -> &'static str {
 }
 
 /// When off, always force-disable so config cannot leak memory on.
+#[allow(dead_code)]
 pub fn should_force_disable_memory(experimental_memory: bool) -> bool {
     !experimental_memory
 }
@@ -59,12 +59,24 @@ pub fn sync_memory_to_agent_profile(
     Ok(())
 }
 
-/// Args for `grok memory clear` (workspace scope = product default).
-pub fn memory_clear_cli_args(scope: &str) -> Vec<&'static str> {
+/// Args for `grok memory clear`. Unknown scope is an error (never default to workspace).
+pub fn memory_clear_cli_args(scope: &str) -> Result<Vec<&'static str>, String> {
     match scope.trim().to_ascii_lowercase().as_str() {
-        "global" => vec!["memory", "clear", "-y", "--global"],
-        "all" => vec!["memory", "clear", "-y", "--all"],
-        _ => vec!["memory", "clear", "-y", "--workspace"],
+        "global" => Ok(vec!["memory", "clear", "-y", "--global"]),
+        "all" => Ok(vec!["memory", "clear", "-y", "--all"]),
+        "workspace" => Ok(vec!["memory", "clear", "-y", "--workspace"]),
+        other => Err(format!("unknown_memory_scope:{other}")),
+    }
+}
+
+/// Resolve cwd for `grok memory clear`. Workspace / all never fall back to `$HOME`.
+pub fn resolve_memory_clear_cwd(cwd: Option<&Path>, scope: &str) -> Result<PathBuf, String> {
+    let scope = scope.trim().to_ascii_lowercase();
+    let dir = cwd.map(Path::to_path_buf).filter(|p| p.is_dir());
+    match scope.as_str() {
+        "workspace" | "all" => dir.ok_or_else(|| "workspace_path_missing".to_string()),
+        "global" => Ok(dir.unwrap_or_else(process_util::user_home)),
+        other => Err(format!("unknown_memory_scope:{other}")),
     }
 }
 
@@ -90,13 +102,10 @@ pub fn clear_workspace_memory(
         .filter(|_| probe.found)
         .ok_or_else(|| "Grok Build CLI not found".to_string())?;
 
-    let work_dir = cwd
-        .map(Path::to_path_buf)
-        .filter(|p| p.is_dir())
-        .unwrap_or_else(process_util::user_home);
+    let args = memory_clear_cli_args(scope)?;
+    let work_dir = resolve_memory_clear_cwd(cwd, scope)?;
 
     let grok_home = resolve_agent_grok_home(session_data_mode);
-    let args = memory_clear_cli_args(scope);
 
     let mut cmd = Command::new(&cli_path);
     cmd.args(&args)
@@ -393,9 +402,13 @@ pub fn workspace_match_tokens(cwd: &Path) -> Vec<String> {
 }
 
 fn git_origin_url(cwd: &Path) -> Option<String> {
-    let output = Command::new("git")
+    // GUI spawn: hide the Windows console (Agent tab memory list used to flash).
+    let output = process_util::command("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .output()
         .ok()?;
     if !output.status.success() {
@@ -981,6 +994,7 @@ fn search_file_content(path: &Path, query_lower: &str, query_len: usize) -> Opti
 /// Always a keyword / file-body scan — never invents embeddings. When
 /// `embedding_configured` is true but no host hybrid CLI exists, `search_kind`
 /// is `hybrid_unavailable` (honest soft-fail).
+#[allow(dead_code)]
 pub fn search_workspace_memory(
     query: &str,
     cwd: Option<&Path>,
@@ -1115,21 +1129,58 @@ mod tests {
     #[test]
     fn clear_args() {
         assert_eq!(
-            memory_clear_cli_args("workspace"),
+            memory_clear_cli_args("workspace").unwrap(),
             vec!["memory", "clear", "-y", "--workspace"]
         );
         assert_eq!(
-            memory_clear_cli_args("global"),
+            memory_clear_cli_args("global").unwrap(),
             vec!["memory", "clear", "-y", "--global"]
         );
         assert_eq!(
-            memory_clear_cli_args("all"),
+            memory_clear_cli_args("all").unwrap(),
             vec!["memory", "clear", "-y", "--all"]
         );
+        assert!(memory_clear_cli_args("")
+            .unwrap_err()
+            .contains("unknown_memory_scope"));
+        assert!(memory_clear_cli_args("session")
+            .unwrap_err()
+            .contains("unknown_memory_scope"));
         assert_eq!(
-            memory_clear_cli_args(""),
-            vec!["memory", "clear", "-y", "--workspace"]
+            memory_clear_cli_args("GLOBAL").unwrap(),
+            vec!["memory", "clear", "-y", "--global"]
         );
+    }
+
+    #[test]
+    fn clear_cwd_fail_closed() {
+        assert_eq!(
+            resolve_memory_clear_cwd(None, "workspace").unwrap_err(),
+            "workspace_path_missing"
+        );
+        let missing = std::env::temp_dir().join("grok-app-no-such-memory-dir");
+        let _ = std::fs::remove_dir_all(&missing);
+        assert_eq!(
+            resolve_memory_clear_cwd(Some(&missing), "workspace").unwrap_err(),
+            "workspace_path_missing"
+        );
+        assert_eq!(
+            resolve_memory_clear_cwd(Some(&missing), "all").unwrap_err(),
+            "workspace_path_missing"
+        );
+        assert!(resolve_memory_clear_cwd(None, "session")
+            .unwrap_err()
+            .contains("unknown_memory_scope"));
+        assert!(resolve_memory_clear_cwd(None, "global").is_ok());
+        assert!(resolve_memory_clear_cwd(Some(&std::env::temp_dir()), "workspace").is_ok());
+        let file_cwd = std::env::temp_dir().join("grok-app-memory-not-a-dir");
+        let _ = std::fs::remove_file(&file_cwd);
+        std::fs::write(&file_cwd, b"not a dir").expect("write not-dir cwd");
+        assert_eq!(
+            resolve_memory_clear_cwd(Some(&file_cwd), "workspace").unwrap_err(),
+            "workspace_path_missing"
+        );
+        let _ = std::fs::remove_file(&file_cwd);
     }
 
     #[test]
@@ -1228,7 +1279,9 @@ mod tests {
         fs::write(ws.join("index.sqlite"), b"SQLite format 3\0fake").unwrap();
 
         // Point independent mode agent home at tmp via GROK_APP_HOME.
-        let _guard = crate::paths::APP_HOME_ENV_LOCK.lock().unwrap();
+        let _guard = crate::paths::APP_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Safety: only for this process during test.
         std::env::set_var("GROK_APP_HOME", &tmp);
         // agent-home is under app data; memory for independent is agent-home/memory
@@ -1390,7 +1443,9 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let _guard = crate::paths::APP_HOME_ENV_LOCK.lock().unwrap();
+        let _guard = crate::paths::APP_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var("GROK_APP_HOME", &tmp);
         let agent_mem = tmp.join("agent-home").join("memory");
         let slug = "demo-search-cafe0123";

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::account::{self, AccountProfile};
@@ -62,7 +62,19 @@ fn load_index() -> AccountsIndex {
         return AccountsIndex::default();
     }
     match fs::read_to_string(&p) {
-        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Ok(s) if s.trim().is_empty() => AccountsIndex::default(),
+        Ok(s) => match serde_json::from_str(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                // A torn index used to parse as "no accounts". The next save
+                // then overwrote the only copy. Keep the bytes beside it.
+                error!("corrupt accounts index {} ({e}); quarantining", p.display());
+                let stamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+                let bak = p.with_extension(format!("corrupt-{stamp}.json"));
+                let _ = fs::rename(&p, &bak);
+                AccountsIndex::default()
+            }
+        },
         Err(_) => AccountsIndex::default(),
     }
 }
@@ -71,7 +83,9 @@ fn save_index(idx: &AccountsIndex) -> Result<(), String> {
     let root = accounts_root();
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let raw = serde_json::to_string_pretty(idx).map_err(|e| e.to_string())?;
-    fs::write(index_path(), raw).map_err(|e| e.to_string())
+    // Temp + rename under an exclusive lock. A crash mid-write must not leave
+    // a truncated index.json for the loader to treat as an empty account list.
+    crate::store_lock::write_bytes_atomic(&index_path(), raw.as_bytes())
 }
 
 fn label_from_profile(p: &AccountProfile) -> String {
@@ -254,9 +268,10 @@ pub fn switch_account(id: &str) -> Result<AccountProfile, String> {
         let _ = fs::set_permissions(&cli_auth, fs::Permissions::from_mode(0o600));
     }
 
-    if let Err(e) = account::sync_cli_auth_to_agent_home() {
-        warn!("account_profiles: agent-home sync after switch: {e}");
-    }
+    // ~/.grok/auth.json is the canonical login (billing / official-aux).
+    // Agent-home must follow the *current* route: official syncs OIDC,
+    // custom must not receive auth.json (OIDC pollution).
+    crate::providers::prepare_route_auth_for_agent();
 
     let mut idx = load_index();
     idx.active_id = Some(id.to_string());
@@ -323,6 +338,87 @@ fn current_auth_source() -> Result<PathBuf, String> {
     Err("No auth.json found. Sign in first.".into())
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountQuotaItem {
+    pub id: String,
+    pub remaining_percent: Option<f64>,
+    pub used_percent: Option<f64>,
+    pub subscription_tier: Option<String>,
+    pub resets_at: Option<String>,
+    pub available: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountsQuotaResult {
+    #[serde(default)]
+    pub items: Vec<AccountQuotaItem>,
+    #[serde(default)]
+    pub fetched_at: String,
+}
+
+fn quota_probe_failed(snap: &crate::supergrok_quota::AccountQuotaSnapshot) -> bool {
+    snap.last_error.is_some() || snap.source == "error" || snap.source == "empty"
+}
+
+fn quota_item_from_snapshot(
+    id: String,
+    snap: crate::supergrok_quota::AccountQuotaSnapshot,
+) -> AccountQuotaItem {
+    // Never invent 0% / 100% when the SuperGrok probe failed.
+    if quota_probe_failed(&snap) {
+        return AccountQuotaItem {
+            id,
+            remaining_percent: None,
+            used_percent: None,
+            subscription_tier: None,
+            resets_at: None,
+            available: false,
+        };
+    }
+    AccountQuotaItem {
+        id,
+        remaining_percent: Some(f64::from(snap.remaining_percent)),
+        used_percent: Some(f64::from(snap.used_percent)),
+        subscription_tier: None,
+        resets_at: snap.resets_at.map(|d| d.to_rfc3339()),
+        available: true,
+    }
+}
+
+fn unavailable_quota_item(id: String) -> AccountQuotaItem {
+    AccountQuotaItem {
+        id,
+        remaining_percent: None,
+        used_percent: None,
+        subscription_tier: None,
+        resets_at: None,
+        available: false,
+    }
+}
+
+/// Live SuperGrok remaining % for every saved snapshot (best-effort, parallel).
+/// Reuses `fetch_quota_best_effort` — same probe as the active `account_status`.
+pub async fn fetch_accounts_quota() -> AccountsQuotaResult {
+    let idx = load_index();
+    let futs = idx.profiles.into_iter().map(|p| {
+        let id = p.id;
+        async move {
+            let Some(token) = access_token_for_account(&id) else {
+                return unavailable_quota_item(id);
+            };
+            let snap = crate::supergrok_quota::fetch_quota_best_effort(&token).await;
+            quota_item_from_snapshot(id, snap)
+        }
+    });
+    let items = futures_util::future::join_all(futs).await;
+    AccountsQuotaResult {
+        items,
+        fetched_at: Utc::now().to_rfc3339(),
+    }
+}
+
 /// After a successful login, auto-snapshot so multi-account list stays current.
 pub fn auto_snapshot_after_login() {
     match save_current_account(None) {
@@ -376,5 +472,108 @@ mod tests {
         assert_eq!(resolve_account_pick("one@x.ai", &profiles).unwrap(), "u1");
         assert!(resolve_account_pick("0", &profiles).is_err());
         assert!(resolve_account_pick("missing", &profiles).is_err());
+    }
+
+    #[test]
+    fn quota_item_hides_percent_when_probe_failed() {
+        let mut snap = crate::supergrok_quota::default_unused_quota_snapshot();
+        snap.source = "error".into();
+        snap.last_error = Some("network".into());
+        let item = quota_item_from_snapshot("u1".into(), snap);
+        assert!(!item.available);
+        assert!(item.remaining_percent.is_none());
+        assert!(item.used_percent.is_none());
+    }
+
+    #[test]
+    fn quota_item_hides_empty_placeholder_snapshot() {
+        let snap = crate::supergrok_quota::default_unused_quota_snapshot();
+        let item = quota_item_from_snapshot("u1".into(), snap);
+        assert!(!item.available);
+        assert!(item.remaining_percent.is_none());
+    }
+
+    #[test]
+    fn quota_item_keeps_real_zero_remaining() {
+        let snap = crate::supergrok_quota::AccountQuotaSnapshot::from_used(
+            100.0,
+            None,
+            None,
+            Vec::new(),
+            "grpc-web",
+        );
+        let item = quota_item_from_snapshot("u1".into(), snap);
+        assert!(item.available);
+        assert_eq!(item.remaining_percent, Some(0.0));
+        assert_eq!(item.used_percent, Some(100.0));
+    }
+}
+
+#[cfg(test)]
+mod index_persistence_tests {
+    use super::*;
+
+    /// Serialize against other tests that mutate GROK_APP_HOME.
+    struct HomeGuard(Option<String>);
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("GROK_APP_HOME", v),
+                None => std::env::remove_var("GROK_APP_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_index_roundtrips_and_quarantines_a_torn_write() {
+        let _lock = crate::paths::APP_HOME_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = std::env::temp_dir().join(format!(
+            "grok-acct-idx-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let prev = std::env::var("GROK_APP_HOME").ok();
+        std::env::set_var("GROK_APP_HOME", &home);
+        let _guard = HomeGuard(prev);
+        fs::create_dir_all(accounts_root()).unwrap();
+
+        let idx = AccountsIndex {
+            active_id: Some("u1".into()),
+            profiles: vec![SavedAccount {
+                id: "u1".into(),
+                email: Some("one@x.ai".into()),
+                display_name: None,
+                label: "Work".into(),
+                updated_at: "t".into(),
+            }],
+        };
+        save_index(&idx).expect("save");
+
+        let loaded = load_index();
+        assert_eq!(loaded.active_id.as_deref(), Some("u1"));
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].label, "Work");
+
+        // Half-written JSON must be moved aside, not left in place for the
+        // next save to replace with an empty list.
+        let p = index_path();
+        fs::write(&p, "{\"activeId\":\"u1\",\"prof").unwrap();
+        let recovered = load_index();
+        assert!(recovered.profiles.is_empty());
+        assert!(!p.is_file(), "torn index must not stay at the live path");
+        let quarantined: Vec<_> = fs::read_dir(accounts_root())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "torn index must be quarantined");
+        let bak = accounts_root().join(&quarantined[0]);
+        let kept = fs::read_to_string(&bak).unwrap();
+        assert!(kept.contains("activeId"), "{kept}");
+
+        let _ = fs::remove_dir_all(&home);
     }
 }

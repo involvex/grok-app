@@ -20,6 +20,22 @@ pub async fn automation_update(
     store::update_automation(&id, input)
 }
 
+/// Rebind a reused schedule to the chat a run created after its target was
+/// deleted. No-op (`None`) when the schedule no longer points at the missing
+/// chat, so a concurrent user edit wins.
+#[tauri::command]
+pub async fn automation_rebind_reuse_session(
+    id: String,
+    expected_session_id: Option<String>,
+    session_id: String,
+) -> Result<Option<store::Automation>, String> {
+    store::set_automation_session_id_if_reuse(
+        &id,
+        expected_session_id.as_deref(),
+        &session_id,
+    )
+}
+
 #[tauri::command]
 pub async fn automation_set_enabled(
     id: String,
@@ -64,7 +80,7 @@ pub async fn automation_runner_status(
 #[tauri::command]
 pub async fn schedules_launch_agent_status(
 ) -> Result<crate::schedules_launch_agent::SchedulesLaunchAgentStatus, String> {
-    let enabled = store::load_settings().schedules_launch_agent;
+    let enabled = store::load_settings_async().await.schedules_launch_agent;
     Ok(crate::schedules_launch_agent::status(enabled))
 }
 
@@ -78,10 +94,10 @@ pub async fn schedules_launch_agent_set_enabled(
     } else {
         crate::schedules_launch_agent::disable()?
     };
-    let mut settings = store::load_settings();
+    let mut settings = store::load_settings_async().await;
     // Non-macOS never claims enabled; install is a no-op there.
     settings.schedules_launch_agent = enabled && status.supported;
-    store::save_settings(&settings)?;
+    store::save_settings_async(&settings).await?;
     Ok(crate::schedules_launch_agent::status(
         settings.schedules_launch_agent,
     ))

@@ -2,7 +2,7 @@
 //! `[memory.*]` keys in the active `GROK_HOME` `config.toml`.
 //!
 //! ## Allowlist (soft-fail when missing)
-//! - `[memory.embedding]` model / dimensions / provider
+//! - `[memory.embedding]` model / dimensions / provider / base_url / api_key
 //! - `[memory.search]` max_results / min_score / vector_weight / text_weight
 //! - `[memory.search.mmr]` enabled / lambda
 //! - `[memory.search.temporal_decay]` enabled / half_life_days
@@ -28,6 +28,7 @@ use crate::agent_config_edit::{
     set_table_key,
 };
 use crate::agent_config_view::{config_toml_path, normalize_mode};
+use crate::agent_home_config::{parse_table_header, with_config_write_lock};
 use crate::paths::{agent_config_toml, agent_home_dir, ensure_app_dirs, resolve_agent_grok_home};
 use crate::store;
 
@@ -55,6 +56,11 @@ pub struct MemoryEmbedConfigSnapshot {
     pub embedding_model: Option<String>,
     pub embedding_dimensions: Option<u32>,
     pub embedding_provider: Option<String>,
+    /// OpenAI-compatible embedding root. Round-tripped even if current CLI docs omit it.
+    pub embedding_base_url: Option<String>,
+    /// True when `[memory.embedding] api_key` is non-empty. Never returned plaintext.
+    #[serde(default)]
+    pub has_embedding_api_key: bool,
     // --- search ---
     pub search_max_results: Option<u32>,
     pub search_min_score: Option<f64>,
@@ -88,6 +94,11 @@ pub struct MemoryEmbedConfigPatch {
     pub clear_embedding_model: Option<bool>,
     pub embedding_dimensions: Option<u32>,
     pub embedding_provider: Option<String>,
+    pub embedding_base_url: Option<String>,
+    pub clear_embedding_base_url: Option<bool>,
+    /// New key; empty / omitted keeps the existing secret.
+    pub embedding_api_key: Option<String>,
+    pub clear_embedding_api_key: Option<bool>,
     pub search_max_results: Option<u32>,
     pub search_min_score: Option<f64>,
     pub search_vector_weight: Option<f64>,
@@ -111,6 +122,10 @@ impl MemoryEmbedConfigPatch {
             && self.clear_embedding_model != Some(true)
             && self.embedding_dimensions.is_none()
             && self.embedding_provider.is_none()
+            && self.embedding_base_url.is_none()
+            && self.clear_embedding_base_url != Some(true)
+            && self.embedding_api_key.is_none()
+            && self.clear_embedding_api_key != Some(true)
             && self.search_max_results.is_none()
             && self.search_min_score.is_none()
             && self.search_vector_weight.is_none()
@@ -135,6 +150,8 @@ pub struct MemoryEmbedFlags {
     pub embedding_model: Option<String>,
     pub embedding_dimensions: Option<u32>,
     pub embedding_provider: Option<String>,
+    pub embedding_base_url: Option<String>,
+    pub embedding_api_key: Option<String>,
     pub search_max_results: Option<u32>,
     pub search_min_score: Option<f64>,
     pub search_vector_weight: Option<f64>,
@@ -199,11 +216,16 @@ pub fn parse_memory_embed_flags(text: &str) -> MemoryEmbedFlags {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            table = trimmed
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_string();
+        // Same header rules as the writer (`[memory.embedding] # note`, quoted
+        // names that contain `]`). A naive `ends_with(']')` miss attributes
+        // later keys to the previous table, so a saved base_url/api_key does
+        // not echo and a clear can delete the wrong line.
+        if let Some((is_array, name)) = parse_table_header(trimmed) {
+            table = if is_array {
+                format!("[[{name}]]")
+            } else {
+                name.to_string()
+            };
             continue;
         }
         let Some(eq) = trimmed.find('=') else {
@@ -227,6 +249,18 @@ pub fn parse_memory_embed_flags(text: &str) -> MemoryEmbedFlags {
                 let s = parse_toml_scalar(val);
                 if !s.is_empty() {
                     flags.embedding_provider = Some(s);
+                }
+            }
+            ("memory.embedding", "base_url") => {
+                let s = parse_toml_scalar(val);
+                if !s.is_empty() {
+                    flags.embedding_base_url = Some(s);
+                }
+            }
+            ("memory.embedding", "api_key") => {
+                let s = parse_toml_scalar(val);
+                if !s.is_empty() {
+                    flags.embedding_api_key = Some(s);
                 }
             }
             ("memory.search", "max_results") => {
@@ -313,25 +347,25 @@ pub fn parse_memory_embed_flags(text: &str) -> MemoryEmbedFlags {
 
 /// Remove `key` under `[table]` if present (pure). Leaves other sections intact.
 pub fn remove_table_key(text: &str, table: &str, key: &str) -> String {
-    let header = format!("[{table}]");
     let mut lines: Vec<String> = text.lines().map(|s| s.to_string()).collect();
     let mut in_table = false;
-    let mut remove_idx: Option<usize> = None;
+    let mut remove_idxs: Vec<usize> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
-            in_table = trimmed == header;
+            in_table = parse_table_header(trimmed)
+                .map(|(is_array, name)| !is_array && name == table)
+                .unwrap_or(false);
             continue;
         }
         if in_table {
             let key_part = trimmed.split('=').next().map(str::trim).unwrap_or("");
             if key_part == key {
-                remove_idx = Some(i);
-                break;
+                remove_idxs.push(i);
             }
         }
     }
-    if let Some(i) = remove_idx {
+    for i in remove_idxs.into_iter().rev() {
         lines.remove(i);
     }
     let mut joined = lines.join("\n");
@@ -368,6 +402,26 @@ pub fn apply_memory_embed_patch(text: &str, patch: &MemoryEmbedConfigPatch) -> S
         let s = p.trim();
         if !s.is_empty() {
             next = set_table_key(&next, "memory.embedding", "provider", s, true);
+        }
+    }
+    if patch.clear_embedding_base_url == Some(true) {
+        next = remove_table_key(&next, "memory.embedding", "base_url");
+    } else if let Some(ref url) = patch.embedding_base_url {
+        let s = url.trim();
+        if s.is_empty() {
+            next = remove_table_key(&next, "memory.embedding", "base_url");
+        } else {
+            next = set_table_key(&next, "memory.embedding", "base_url", s, true);
+        }
+    }
+    if patch.clear_embedding_api_key == Some(true) {
+        next = remove_table_key(&next, "memory.embedding", "api_key");
+    } else if let Some(ref key) = patch.embedding_api_key {
+        let s = key.trim();
+        if s.is_empty() {
+            next = remove_table_key(&next, "memory.embedding", "api_key");
+        } else {
+            next = set_table_key(&next, "memory.embedding", "api_key", s, true);
         }
     }
     if let Some(n) = patch.search_max_results {
@@ -479,8 +533,7 @@ pub fn extract_memory_embed_sections(text: &str) -> String {
     let mut any = false;
     for line in text.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            let name = trimmed.trim_start_matches('[').trim_end_matches(']');
+        if let Some((_, name)) = parse_table_header(trimmed) {
             keep = name == "memory" || name.starts_with("memory.");
             if keep {
                 if any {
@@ -553,6 +606,11 @@ fn snapshot_from_raw(
         embedding_model: flags.embedding_model,
         embedding_dimensions: flags.embedding_dimensions,
         embedding_provider: flags.embedding_provider,
+        embedding_base_url: flags.embedding_base_url,
+        has_embedding_api_key: flags
+            .embedding_api_key
+            .as_ref()
+            .is_some_and(|s| !s.trim().is_empty()),
         search_max_results: flags.search_max_results,
         search_min_score: flags.search_min_score,
         search_vector_weight: flags.search_vector_weight,
@@ -660,9 +718,13 @@ pub fn save_memory_embed_config(
         fs::create_dir_all(parent).map_err(|e| format!("create agent-home: {e}"))?;
     }
 
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let next = apply_memory_embed_patch(&existing, patch);
-    fs::write(&path, &next).map_err(|e| format!("write config: {e}"))?;
+    // Hold the same lock as heal / provider writes so a concurrent rewrite
+    // cannot drop the keys this save just added.
+    with_config_write_lock(|| {
+        let existing = fs::read_to_string(&path).unwrap_or_default();
+        let next = apply_memory_embed_patch(&existing, patch);
+        fs::write(&path, &next).map_err(|e| format!("write config: {e}"))
+    })?;
 
     tracing::info!(
         path = %path.display(),
@@ -679,233 +741,5 @@ pub fn save_memory_embed_config(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    fn temp_app_home(label: &str) -> PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let p = std::env::temp_dir().join(format!(
-            "grok-mem-embed-{}-{}-{}",
-            label,
-            std::process::id(),
-            nanos
-        ));
-        let _ = fs::remove_dir_all(&p);
-        fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    #[test]
-    fn parse_missing_keys_are_none() {
-        let flags = parse_memory_embed_flags("[ui]\nyolo = true\n");
-        assert_eq!(flags, MemoryEmbedFlags::default());
-    }
-
-    #[test]
-    fn parse_allowlisted_nested_memory_keys() {
-        let text = r#"
-[memory]
-enabled = true
-
-[memory.embedding]
-model = "text-embedding-3-small"
-dimensions = 1024
-provider = "api"
-
-[memory.search]
-max_results = 8
-min_score = 0.35
-vector_weight = 0.7
-text_weight = 0.3
-
-[memory.search.mmr]
-enabled = true
-lambda = 0.7
-
-[memory.search.temporal_decay]
-enabled = true
-half_life_days = 7.0
-
-[memory.dream]
-enabled = false
-min_hours = 4
-min_sessions = 3
-check_interval_secs = 3600
-
-[memory.watcher]
-enabled = true
-
-[memory.initial_injection]
-enabled = true
-min_score = 0.0
-
-[model.x]
-api_key = "sk-abcdefghijklmnopqrstuvwxyz0123"
-"#;
-        let flags = parse_memory_embed_flags(text);
-        assert_eq!(
-            flags.embedding_model.as_deref(),
-            Some("text-embedding-3-small")
-        );
-        assert_eq!(flags.embedding_dimensions, Some(1024));
-        assert_eq!(flags.embedding_provider.as_deref(), Some("api"));
-        assert_eq!(flags.search_max_results, Some(8));
-        assert_eq!(flags.search_min_score, Some(0.35));
-        assert_eq!(flags.mmr_enabled, Some(true));
-        assert_eq!(flags.mmr_lambda, Some(0.7));
-        assert_eq!(flags.temporal_decay_enabled, Some(true));
-        assert_eq!(flags.dream_enabled, Some(false));
-        assert_eq!(flags.dream_min_sessions, Some(3));
-        assert_eq!(flags.watcher_enabled, Some(true));
-        assert_eq!(flags.initial_injection_enabled, Some(true));
-    }
-
-    #[test]
-    fn apply_patch_sets_nested_tables_and_clears_model() {
-        let existing = r#"
-[models]
-default = "grok"
-
-[memory.embedding]
-model = "old-model"
-dimensions = 512
-"#;
-        let next = apply_memory_embed_patch(
-            existing,
-            &MemoryEmbedConfigPatch {
-                clear_embedding_model: Some(true),
-                embedding_dimensions: Some(1024),
-                mmr_enabled: Some(true),
-                mmr_lambda: Some(0.7),
-                search_min_score: Some(0.4),
-                dream_enabled: Some(false),
-                ..Default::default()
-            },
-        );
-        assert!(next.contains("[models]"), "{next}");
-        assert!(next.contains("default = \"grok\""), "{next}");
-        assert!(!next.contains("old-model"), "{next}");
-        assert!(next.contains("dimensions = 1024"), "{next}");
-        assert!(next.contains("[memory.search.mmr]"), "{next}");
-        assert!(next.contains("enabled = true"), "{next}");
-        assert!(
-            next.contains("lambda = 0.7") || next.contains("lambda = 0.700"),
-            "{next}"
-        );
-        assert!(next.contains("[memory.search]"), "{next}");
-        assert!(
-            next.contains("min_score = 0.4") || next.contains("min_score = 0.40"),
-            "{next}"
-        );
-        assert!(next.contains("[memory.dream]"), "{next}");
-        assert!(next.contains("enabled = false"), "{next}");
-    }
-
-    #[test]
-    fn extract_sections_keeps_memory_tables_only() {
-        let text = r#"
-[features]
-telemetry = false
-
-[memory.embedding]
-model = "m"
-
-[model.x]
-api_key = "sk-abcdefghijklmnopqrstuvwxyz0123"
-"#;
-        let preview = extract_memory_embed_sections(text);
-        assert!(preview.contains("[memory.embedding]"));
-        assert!(preview.contains("model = \"m\""));
-        assert!(!preview.contains("[features]"));
-        assert!(!preview.contains("[model.x]"));
-        assert!(!preview.contains("sk-"));
-    }
-
-    #[test]
-    fn load_and_save_roundtrip_independent() {
-        let _lock = crate::paths::APP_HOME_ENV_LOCK.lock().unwrap();
-        let tmp = temp_app_home("roundtrip");
-        let prev = std::env::var("GROK_APP_HOME").ok();
-        std::env::set_var("GROK_APP_HOME", &tmp);
-
-        let _ = ensure_app_dirs();
-        let mut s = store::load_settings();
-        s.session_data_mode = "independent".into();
-        store::save_settings(&s).unwrap();
-
-        let snap = load_memory_embed_config().unwrap();
-        assert!(snap.writable);
-        assert!(snap.path.contains("agent-home"));
-        assert!(!snap.embedding_configured);
-        assert_eq!(snap.app_search_mode, "keyword");
-        assert_eq!(snap.cli_search_mode, "keyword");
-        assert_eq!(snap.embedding_model, None);
-
-        let saved = save_memory_embed_config(&MemoryEmbedConfigPatch {
-            embedding_model: Some("text-embedding-3-small".into()),
-            embedding_dimensions: Some(1024),
-            search_max_results: Some(6),
-            search_min_score: Some(0.35),
-            mmr_enabled: Some(false),
-            dream_enabled: Some(true),
-            dream_min_sessions: Some(3),
-            watcher_enabled: Some(true),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(saved.embedding_configured);
-        assert_eq!(saved.cli_search_mode, "hybrid");
-        assert_eq!(
-            saved.embedding_model.as_deref(),
-            Some("text-embedding-3-small")
-        );
-        assert_eq!(saved.embedding_dimensions, Some(1024));
-        assert_eq!(saved.mmr_enabled, Some(false));
-        assert!(saved.file_exists);
-
-        let cleared = save_memory_embed_config(&MemoryEmbedConfigPatch {
-            clear_embedding_model: Some(true),
-            ..Default::default()
-        })
-        .unwrap();
-        assert!(!cleared.embedding_configured);
-        assert_eq!(cleared.cli_search_mode, "keyword");
-        assert_eq!(cleared.embedding_model, None);
-
-        match prev {
-            Some(v) => std::env::set_var("GROK_APP_HOME", v),
-            None => std::env::remove_var("GROK_APP_HOME"),
-        }
-        let _ = fs::remove_dir_all(&tmp);
-    }
-
-    #[test]
-    fn save_refuses_shared_mode() {
-        let _lock = crate::paths::APP_HOME_ENV_LOCK.lock().unwrap();
-        let tmp = temp_app_home("shared");
-        let prev = std::env::var("GROK_APP_HOME").ok();
-        std::env::set_var("GROK_APP_HOME", &tmp);
-        let _ = ensure_app_dirs();
-        let mut s = store::load_settings();
-        s.session_data_mode = "shared".into();
-        store::save_settings(&s).unwrap();
-
-        let err = save_memory_embed_config(&MemoryEmbedConfigPatch {
-            mmr_enabled: Some(true),
-            ..Default::default()
-        })
-        .unwrap_err();
-        assert!(err.contains("shared"), "{err}");
-
-        match prev {
-            Some(v) => std::env::set_var("GROK_APP_HOME", v),
-            None => std::env::remove_var("GROK_APP_HOME"),
-        }
-        let _ = fs::remove_dir_all(&tmp);
-    }
-}
+#[path = "agent_memory_embed_tests.rs"]
+mod tests;
